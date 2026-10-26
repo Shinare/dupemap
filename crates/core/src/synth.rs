@@ -112,7 +112,7 @@ const EVENTS: &[&str] = &[
     "Christmas",
     "Birthday",
     "Kraków trip",
-    "Belfast Marathon",
+    "City Marathon",
     "Giant's Causeway",
     "Gdańsk",
     "Zakopane hike",
