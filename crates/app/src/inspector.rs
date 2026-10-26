@@ -182,13 +182,18 @@ fn location_row(ui: &mut Ui, l: &Location, selected: bool, on_this_pc: bool, act
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if selected {
-                    ui.label(RichText::new("●").color(colors::ACCENT)).on_hover_text("The file you selected");
-                }
-                ui.add(egui::Label::new(RichText::new(&l.path).color(colors::INK)).wrap());
-            });
+            // one wrapping label, so the marker of the selected copy stays in front of its path
+            let mut job = egui::text::LayoutJob::default();
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            if selected {
+                // a no-break space: a long path must not leave the marker alone on its line
+                job.append("●\u{a0}", 0.0, egui::TextFormat::simple(font.clone(), colors::ACCENT));
+            }
+            job.append(&l.path, 0.0, egui::TextFormat::simple(font, colors::INK));
+            let resp = ui.add(egui::Label::new(job).wrap());
+            if selected {
+                resp.on_hover_text("The selected file");
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Show").on_hover_text("Open this copy in a tab").clicked() {
                     actions.push(Action::ShowInTab(l.file));
