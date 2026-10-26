@@ -7,7 +7,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # write: the screenshot step pushes PNGs to a ci-shots/* branch
+  contents: write
   pull-requests: write
 
 env:
@@ -70,11 +71,57 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "dupemap-bench failed with $LASTEXITCODE" }
           Get-Content "$env:RUNNER_TEMP\bench.md"
 
+      - name: Run the app and take screenshots
+        id: shots
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The runner has no GPU, so give the app Mesa's software OpenGL (llvmpipe) next to a copy
+          # of the exe. The released DupeMap.exe uses the system's OpenGL driver.
+          $t = "$env:RUNNER_TEMP\appshot"
+          New-Item -ItemType Directory -Force -Path "$t\shots" | Out-Null
+          gh release download --repo pal1000/mesa-dist-win --pattern "mesa3d-*-release-msvc.7z" --dir "$t" --clobber
+          $archive = Get-ChildItem "$t\mesa3d-*-release-msvc.7z" | Select-Object -First 1
+          if (-not $archive) { throw "Mesa download failed" }
+          7z x $archive.FullName "-o$t\mesa" -y | Out-Null
+          Copy-Item "$t\mesa\x64\*.dll" "$t\"
+          Copy-Item ".\target\release\DupeMap.exe" "$t\"
+          $p = Start-Process -FilePath "$t\DupeMap.exe" -ArgumentList @("--db", "$t\shot.db", "--demo", "300000", "--screenshot", "$t\shots\dupemap.png") -PassThru
+          if (-not $p.WaitForExit(240000)) { $p.Kill(); throw "DupeMap did not finish its screenshots within 4 minutes" }
+          Get-ChildItem "$t\shots" | Format-Table Name, Length
+          if (-not (Test-Path "$t\shots\dupemap.png")) { throw "no screenshot written (exit code $($p.ExitCode))" }
+
+      - name: Compress and publish screenshots
+        if: steps.shots.outcome == 'success' && github.event_name == 'pull_request'
+        continue-on-error: true
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $dir = "$env:RUNNER_TEMP\appshot\shots"
+          $out = "$env:RUNNER_TEMP\shots-branch"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Get-ChildItem "$dir\*.png" | ForEach-Object {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $img.Save("$out\$($_.Name)", [System.Drawing.Imaging.ImageFormat]::Png)
+            $img.Dispose()
+          }
+          Set-Location $out
+          git init -q
+          git checkout -q -b shots
+          git add *.png
+          git -c user.name="ci" -c user.email="ci@localhost" commit -q -m "screenshots of ${{ github.event.pull_request.head.sha }}"
+          git push -q -f "https://x-access-token:$env:GH_TOKEN@github.com/${{ github.repository }}.git" "shots:refs/heads/ci-shots/pr-${{ github.event.pull_request.number }}"
+
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v7
         with:
           name: dupemap-windows-x64
           path: |
+            target/release/DupeMap.exe
             target/release/dupemap-gen.exe
             target/release/dupemap-check.exe
             target/release/dupemap-bench.exe
@@ -96,7 +143,8 @@ jobs:
             echo
             echo "- Commit: ${{ github.event.pull_request.head.sha }}"
             echo "- Toolchain: $(rustc --version 2>/dev/null)"
-            echo "- Steps: test **${{ steps.test.outcome }}**, build **${{ steps.build.outcome }}**, smoke test **${{ steps.smoke.outcome }}**"
+            echo "- Steps: test **${{ steps.test.outcome }}**, build **${{ steps.build.outcome }}**, smoke test **${{ steps.smoke.outcome }}**, app screenshots **${{ steps.shots.outcome }}**"
+            echo "- Screenshots: branch \`ci-shots/pr-${{ github.event.pull_request.number }}\`"
             echo "- Tests: $passed passed, $failed failed"
             if [ -f "$RUNNER_TEMP/bench.md" ]; then
               echo

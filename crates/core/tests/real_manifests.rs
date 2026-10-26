@@ -6,6 +6,7 @@
 //! stored file must reproduce its original path exactly, and copy counts must equal a plain
 //! group-by of (hash, size) over the raw rows. Without the variable the test does nothing.
 
+use dupemap_core::ignore::IgnoreSettings;
 use dupemap_core::index::{FileIx, Index};
 use dupemap_core::manifest::{is_header, parse_row, LineReader};
 use dupemap_core::paths::parse_path;
@@ -55,7 +56,10 @@ fn real_manifests_round_trip() {
         }
     }
 
-    let ix = Index::build(&db).unwrap();
+    let ix = Index::build_with(&db, &IgnoreSettings::disabled(), &mut |_, _| {}).unwrap();
+    let with_defaults = Index::build(&db).unwrap();
+    let hidden = with_defaults.ignored_total();
+    eprintln!("default ignore rules hide {} folders, {} files", hidden.folders, hidden.files);
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut by_content: HashMap<u32, (String, u64)> = HashMap::new();
     for f in 0..ix.file_count() as FileIx {

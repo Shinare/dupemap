@@ -9,6 +9,7 @@
 //! (manifest file date, falling back to import time), and on a tie the later import.
 
 use crate::error::{err, Error, Result};
+use crate::ignore::IgnoreSettings;
 use crate::manifest::{is_header, parse_row, Counting, Digest, LineReader, Malformed, Row};
 use crate::paths::{self, Comp, PathKind};
 use crate::report::{ImportReport, Overlap, Samples, Severity};
@@ -20,7 +21,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Algorithm id reserved for SHA-256.
 pub const ALGO_SHA256: i64 = 0;
@@ -84,6 +85,10 @@ CREATE TABLE IF NOT EXISTS file (
 CREATE INDEX IF NOT EXISTS file_by_dir ON file(dir_id, ifnull(name_key, name));
 CREATE INDEX IF NOT EXISTS file_by_manifest ON file(manifest_id);
 CREATE INDEX IF NOT EXISTS file_shadowed ON file(shadowed_by) WHERE shadowed_by IS NOT NULL;
+CREATE TABLE IF NOT EXISTS setting (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 INSERT OR IGNORE INTO algo(id, name) VALUES (0, 'sha256');
 INSERT OR IGNORE INTO ext(id, name) VALUES (0, '');
 "#;
@@ -162,6 +167,8 @@ impl Db {
     /// Open (or create) a database file.
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
+        // the app reads on one connection while a background job writes on another
+        conn.busy_timeout(std::time::Duration::from_secs(60))?;
         Self::init(&conn, true)?;
         Ok(Db { conn, path: Some(path.to_path_buf()) })
     }
@@ -186,21 +193,25 @@ impl Db {
             conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='meta'", [], |r| {
                 r.get::<_, i64>(0)
             })? > 0;
+        let mut current = 0;
         if has_meta {
             let v: Option<String> =
                 conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).optional()?;
-            let v: i64 = v.and_then(|s| s.parse().ok()).unwrap_or(0);
-            if v > SCHEMA_VERSION {
+            current = v.and_then(|s| s.parse().ok()).unwrap_or(0);
+            if current > SCHEMA_VERSION {
                 return err(format!(
-                    "this database was written by a newer DupeMap (schema {v}, this build understands {SCHEMA_VERSION})"
+                    "this database was written by a newer DupeMap (schema {current}, this build understands {SCHEMA_VERSION})"
                 ));
             }
         }
-        conn.execute_batch(SCHEMA)?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [SCHEMA_VERSION.to_string()],
-        )?;
+        if current != SCHEMA_VERSION {
+            // only an older or new database is written to; opening a current one is read-only
+            conn.execute_batch(SCHEMA)?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [SCHEMA_VERSION.to_string()],
+            )?;
+        }
         Ok(())
     }
 
@@ -403,6 +414,40 @@ impl Db {
     pub fn report(&self, mid: i64) -> Result<ImportReport> {
         let json: String = self.conn.query_row("SELECT report FROM manifest WHERE id = ?1", [mid], |r| r.get(0))?;
         Ok(serde_json::from_str(&json)?)
+    }
+
+    /// A stored setting (JSON), if present.
+    pub fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let v: Option<String> =
+            self.conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()?;
+        Ok(match v {
+            Some(s) => Some(serde_json::from_str(&s)?),
+            None => None,
+        })
+    }
+
+    pub fn set_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let json = serde_json::to_string(value)?;
+        self.conn.execute(
+            "INSERT INTO setting(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, json],
+        )?;
+        Ok(())
+    }
+
+    /// Ignore rules: the stored ones (with any new built-in defaults added), or the defaults.
+    pub fn ignore_settings(&self) -> Result<IgnoreSettings> {
+        Ok(match self.setting::<IgnoreSettings>("ignore")? {
+            Some(mut s) => {
+                s.merge_new_defaults();
+                s
+            }
+            None => IgnoreSettings::default(),
+        })
+    }
+
+    pub fn set_ignore_settings(&self, s: &IgnoreSettings) -> Result<()> {
+        self.set_setting("ignore", s)
     }
 
     pub fn set_alert_dismissed(&self, mid: i64, dismissed: bool) -> Result<()> {
@@ -1094,6 +1139,55 @@ mod tests {
         assert_eq!(db.counts().unwrap().files_visible, 1);
         assert_eq!(db.manifests().unwrap()[0].file_name, "a.tsv");
         drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_schema_is_upgraded_and_newer_refused() {
+        let dir = std::env::temp_dir().join(format!("dupemap-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("old.dupemap");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut db = Db::open(&p).unwrap();
+            import(&mut db, "a.tsv", &format!("{A}\t5\tPC\tD:\\x.bin\r\n"));
+            // what a Phase 1 database looked like: schema 1, no settings table
+            db.conn
+                .execute_batch("DROP TABLE setting; UPDATE meta SET value = '1' WHERE key = 'schema_version';")
+                .unwrap();
+        }
+        {
+            let db = Db::open(&p).unwrap();
+            assert_eq!(db.counts().unwrap().files_visible, 1, "data kept");
+            db.set_setting("k", &5).unwrap();
+            assert_eq!(db.setting::<i32>("k").unwrap(), Some(5), "settings table created");
+            let v: String =
+                db.conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION.to_string());
+            db.conn.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'", []).unwrap();
+        }
+        assert!(Db::open(&p).is_err(), "a database from a newer DupeMap is not touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_connection_waits_for_a_writer() {
+        let dir = std::env::temp_dir().join(format!("dupemap-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("busy.dupemap");
+        let _ = std::fs::remove_file(&p);
+        let writer = Db::open(&p).unwrap();
+        writer.conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO setting(key, value) VALUES ('x', '1');").unwrap();
+        let p2 = p.clone();
+        let reader = std::thread::spawn(move || {
+            // opening and reading while another connection holds the write lock must work
+            let db = Db::open(&p2).unwrap();
+            db.manifests().unwrap().len()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        writer.conn.execute_batch("COMMIT;").unwrap();
+        assert_eq!(reader.join().unwrap(), 0);
+        drop(writer);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

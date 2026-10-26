@@ -3,8 +3,8 @@
 Custom cross-machine duplicate file comparator based on hashes.
 
 Explore and compare file-hash manifests from several machines, find duplicates, and (later
-phases) export delete scripts. Windows desktop app in Rust; this repository currently contains
-Phases 0 and 1: the test-data generator and the core library, plus three command-line tools.
+phases) export delete scripts. Windows desktop app in Rust. Done so far: the test-data generator,
+the core library with three command-line tools (Phases 0–1) and the app shell (Phase 2).
 
 ## Layout
 
@@ -12,7 +12,7 @@ Phases 0 and 1: the test-data generator and the core library, plus three command
 |---|---|
 | `crates/core` | `dupemap-core`: manifest parsing and validation, SQLite storage, the in-memory duplicate index, synthetic data generator. All logic lives here and is unit-tested. |
 | `crates/tools` | `dupemap-gen` (synthetic manifests), `dupemap-check` (import real manifests and print reports), `dupemap-bench` (timings). |
-| `crates/app` | Phase 2+: the egui GUI. |
+| `crates/app` | `DupeMap.exe`, the desktop app (egui). |
 
 ## Build (Windows)
 
@@ -28,7 +28,47 @@ cargo build --release
 
 Binaries end up in `target\release\`.
 
-## Try it on your manifests
+## The app
+
+```
+target\release\DupeMap.exe
+```
+
+* **Import**: File → Import manifests (Ctrl+O), or drop `manifest-*.tsv` files, or a folder of
+  them, anywhere on the window. Importing a file with the same name replaces the earlier import.
+  An import report opens afterwards; alerts (non-SHA-256 hashes, malformed lines) stay visible in
+  the status bar and as a ⚠ on the source's tab until you dismiss them (File → Manifests → Report).
+* **Tabs**: every tab shows all sources or one source (the Source box above the table). Add tabs
+  with `+` or Ctrl+T, drag a tab to the side of another to split the view, close with ×.
+* **Columns**: *Size* — the bar is the share of the parent folder, its colour the absolute size
+  (darker blue = smaller, log scale 1 MB → 100 GB). *Files* — files in the folder. *Copies* — for a
+  file, every copy anywhere including itself (pill colour: 2, 3, 4–5, 6+); for a folder, how many of
+  its files have another copy. *Elsewhere* — for a file, copies in **other** sources; for a folder,
+  the share of its bytes that also exist outside it (✔ all = every file has a copy outside).
+  Unique files are dimmed. Sort by Name or Size by clicking the header; drag header edges to resize.
+* **Keyboard**: ↑ ↓ PgUp PgDn Home End move, → expands, ← collapses or goes to the parent,
+  Enter toggles, Ctrl+C copies the path.
+* **Right-click** a folder or file: copy path or name, show in Explorer (for paths on this PC),
+  expand or collapse everything below, **ignore this folder**.
+* **Ignored folders** (File → Ignored folders): folders matching a rule are left out completely —
+  not shown, not counted, and their files never count as copies. Windows system folders, Program
+  Files, ProgramData, `$Recycle.Bin`-style folders, AppData and ZFS `.zfs` snapshot folders are
+  ignored out of the box; `node_modules`, `.git` and `__pycache__` are offered switched off. Add
+  your own folders or patterns, for every source or just one: `D:\Games\Steam`, `?:\Temp` (any
+  drive), `**\node_modules` (anywhere), `/mnt/tank/.recycle`, `gdrive:/Trash`. Matching ignores
+  case. Changes apply when you press Apply (the index is rebuilt; nothing is re-imported).
+
+It draws with OpenGL 3, which every GPU driver of the last decade provides. In a virtual machine
+or remote session without GPU drivers, copy `opengl32.dll` and `libgallium_wgl.dll` from a
+[Mesa for Windows](https://github.com/pal1000/mesa-dist-win/releases) build (x64 folder) next to
+`DupeMap.exe`; that is how the CI runner, which has no GPU, runs it.
+
+The database lives in `%LOCALAPPDATA%\DupeMap\dupemap.db`; `DupeMap.exe --db D:\other.db` uses
+another one. `DupeMap.exe --db C:\tmp\demo.db --demo 1000000` fills a separate database with
+generated demo data. The app reads manifests only; it has no network access and never deletes
+anything.
+
+## Try it on your manifests (command line)
 
 ```
 target\release\dupemap-check C:\Hashes\manifest-*.tsv
