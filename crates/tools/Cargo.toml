@@ -1,0 +1,21 @@
+[package]
+name = "dupemap-tools"
+description = "Test-data generator, benchmark and manifest check tools for DupeMap"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+dupemap-core = { path = "../core" }
+
+[[bin]]
+name = "dupemap-gen"
+path = "src/bin/gen.rs"
+
+[[bin]]
+name = "dupemap-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "dupemap-check"
+path = "src/bin/check.rs"

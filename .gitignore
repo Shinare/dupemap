@@ -1,0 +1,8 @@
+/target
+*.dupemap
+*.dupemap-wal
+*.dupemap-shm
+Cargo.lock.sandbox
+# The sandbox this was developed in resolves crates from source mirrors without checksums;
+# let each machine resolve from crates.io until a lock file from a real build is committed.
+Cargo.lock

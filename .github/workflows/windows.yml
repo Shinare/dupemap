@@ -1,0 +1,68 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: Build and test (Windows x64, MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            windows-cargo-${{ hashFiles('**/Cargo.toml') }}-
+            windows-cargo-
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      - name: Smoke-test the tools on generated data
+        shell: pwsh
+        run: |
+          .\target\release\dupemap-gen.exe --out "$env:RUNNER_TEMP\gen" --rows 200000
+          .\target\release\dupemap-check.exe "$env:RUNNER_TEMP\gen" --top 3
+          # the generated manifests contain deliberate bad lines, so alerts (exit code 1) are expected
+          if ($LASTEXITCODE -ne 1) { throw "dupemap-check: expected exit code 1 (alerts), got $LASTEXITCODE" }
+          .\target\release\dupemap-check.exe "$env:RUNNER_TEMP\gen\manifest-*.tsv" --top 1 | Select-Object -First 5
+          .\target\release\dupemap-bench.exe --rows 1000000 --work "$env:RUNNER_TEMP\bench"
+          if ($LASTEXITCODE -ne 0) { throw "dupemap-bench failed with $LASTEXITCODE" }
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: dupemap-windows-x64
+          path: |
+            target/release/dupemap-gen.exe
+            target/release/dupemap-check.exe
+            target/release/dupemap-bench.exe
+          if-no-files-found: error
+          retention-days: 30
