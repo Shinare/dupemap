@@ -14,8 +14,9 @@
 
 use crate::db::{Db, ALGO_SHA256};
 use crate::error::{err, Result};
+use crate::ignore::{self, IgnoreSettings, RuleEffect};
 use crate::natsort::natural_cmp;
-use crate::paths::{join_path, PathKind};
+use crate::paths::{fold_case, join_path, PathKind};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -141,7 +142,10 @@ pub struct DirRow {
     pub dir: DirIx,
     pub name: String,
     pub stats: DirStats,
+    /// Has child folders with matching files.
     pub has_subdirs: bool,
+    /// Matching files directly in this folder (not in subfolders).
+    pub direct_files: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,13 +193,47 @@ pub struct DupGroup {
     pub flagged: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How the copies of a duplicate group are spread over sources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Spread {
+    #[default]
+    Any,
+    /// Every copy is in one source (duplicates on the same machine, drive or cloud account).
+    OneSource,
+    /// Copies in two or more sources.
+    SeveralSources,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DupQuery {
     /// Only groups with a copy in this source (database id).
     pub involving: Option<i64>,
     pub hash: HashFilter,
     pub min_copies: u32,
+    #[serde(default)]
+    pub spread: Spread,
 }
+
+/// Where the files under a folder have copies outside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutsideCopies {
+    /// Files and bytes under the folder.
+    pub files: u64,
+    pub bytes: u64,
+    /// (source, files, bytes): files under the folder with at least one copy outside it in that
+    /// source. A file counts once per source holding a copy. Most bytes first.
+    pub by_source: Vec<(SourceIx, u64, u64)>,
+    /// Files with no copy anywhere outside the folder.
+    pub alone_files: u64,
+    pub alone_bytes: u64,
+    /// For each source in `by_source`, in the same order: the deepest folder of that source that
+    /// still holds a copy of at least [`MAIN_SHARE`] of those bytes, and the bytes it holds
+    /// ("mostly under E:\Backup\Photos"). Copies spread all over a source give its top folder.
+    pub main_dir: Vec<(SourceIx, DirIx, u64)>,
+}
+
+/// Share of a source's copies a folder must hold to be named as where they mostly are.
+pub const MAIN_SHARE: f64 = 0.9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSummary {
@@ -250,6 +288,8 @@ pub struct Index {
     exts: Vec<String>,
     summaries: Vec<SourceSummary>,
     cache: Mutex<Vec<(Filter, Arc<Rollup>)>>,
+    ignore: IgnoreSettings,
+    ignore_effects: Vec<RuleEffect>,
 }
 
 /// Per-content data read for every file during a rollup, packed into 16 bytes.
@@ -265,14 +305,22 @@ struct ContentHot {
 const ROLLUP_CACHE: usize = 6;
 
 impl Index {
-    /// Build the index from the database.
+    /// Build the index from the database, applying the ignore rules stored in it.
     pub fn build(db: &Db) -> Result<Index> {
         Self::build_with_progress(db, &mut |_, _| {})
     }
 
-    /// Build, reporting (stage, fraction 0..1).
+    /// Build with the stored ignore rules, reporting (stage, fraction 0..1).
     pub fn build_with_progress(db: &Db, progress: &mut dyn FnMut(&str, f32)) -> Result<Index> {
+        let ignore = db.ignore_settings()?;
+        Self::build_with(db, &ignore, progress)
+    }
+
+    /// Build with explicit ignore rules.
+    pub fn build_with(db: &Db, ignore: &IgnoreSettings, progress: &mut dyn FnMut(&str, f32)) -> Result<Index> {
         let conn = db.conn();
+        let rules = ignore::compile(ignore);
+        let mut effects = vec![RuleEffect::default(); ignore.rules.len()];
         progress("sources", 0.0);
         let mut srcs = db.sources()?;
         srcs.sort_by(|a, b| natural_cmp(&a.host, &b.host));
@@ -325,18 +373,57 @@ impl Index {
         let mut sources: Vec<SourceInfo> = Vec::with_capacity(srcs.len());
         let mut source_by_db = HashMap::new();
         let mut t_dense: Vec<u32> = vec![NONE; nt];
+        // rule index that hides a folder (its own match or an ancestor's), u16::MAX = shown
+        let mut t_hidden_by: Vec<u16> = vec![u16::MAX; nt];
         for s in &srcs {
             let Some(&root) = root_of_src.get(&s.id) else { continue };
             let six = sources.len() as SourceIx;
             sources.push(SourceInfo { db_id: s.id, host: s.host.clone(), kind: s.kind, root: order.len() as u32 });
             source_by_db.insert(s.id, six);
-            let mut stack = vec![root];
-            while let Some(t) = stack.pop() {
-                t_dense[t as usize] = order.len() as u32;
-                order.push(t);
-                for &c in t_children[t as usize].iter().rev() {
-                    stack.push(c);
+            let src_rules: Vec<&ignore::Compiled> =
+                rules.iter().filter(|r| r.host.as_deref().is_none_or(|h| h == s.host)).collect();
+            // iterative pre-order walk keeping each rule's pattern position along the path
+            t_dense[root as usize] = order.len() as u32;
+            order.push(root);
+            let mut frames: Vec<(u32, usize)> = vec![(root, 0)];
+            let mut states: Vec<Vec<u64>> = vec![src_rules.iter().map(|r| r.start()).collect()];
+            while let Some(frame) = frames.last_mut() {
+                let t = frame.0 as usize;
+                if frame.1 >= t_children[t].len() {
+                    frames.pop();
+                    states.pop();
+                    continue;
                 }
+                let c = t_children[t][frame.1];
+                frame.1 += 1;
+                let parent_states = states.last().expect("aligned with frames");
+                let mut child_states = Vec::with_capacity(src_rules.len());
+                let mut hit: Option<usize> = None;
+                if parent_states.iter().any(|&x| x != 0) {
+                    let name = fold_case(&t_name[c as usize]);
+                    for (k, r) in src_rules.iter().enumerate() {
+                        let st = if parent_states[k] == 0 { 0 } else { r.step(parent_states[k], &name) };
+                        if hit.is_none() && r.accepts(st) {
+                            hit = Some(r.rule);
+                        }
+                        child_states.push(st);
+                    }
+                } else {
+                    child_states.resize(src_rules.len(), 0);
+                }
+                if let Some(rule) = hit {
+                    effects[rule].folders += 1;
+                    let mut st = vec![c];
+                    while let Some(x) = st.pop() {
+                        t_hidden_by[x as usize] = rule as u16;
+                        st.extend_from_slice(&t_children[x as usize]);
+                    }
+                    continue;
+                }
+                t_dense[c as usize] = order.len() as u32;
+                order.push(c);
+                frames.push((c, 0));
+                states.push(child_states);
             }
         }
         let nd = order.len();
@@ -417,8 +504,15 @@ impl Index {
             let mut rows = st.query([])?;
             let mut n = 0u64;
             while let Some(r) = rows.next()? {
-                let dd = dense_of_db(r.get(1)?);
+                let dir_db_id: i64 = r.get(1)?;
+                let dd = dense_of_db(dir_db_id);
                 if dd == NONE {
+                    let t = t_of_db.get(dir_db_id as usize).copied().unwrap_or(NONE);
+                    if t != NONE && t_hidden_by[t as usize] != u16::MAX {
+                        let e = &mut effects[t_hidden_by[t as usize] as usize];
+                        e.files += 1;
+                        e.bytes += r.get::<_, i64>(2)? as u64;
+                    }
                     continue;
                 }
                 let algo: i64 = r.get(3)?;
@@ -673,6 +767,8 @@ impl Index {
             exts,
             summaries: Vec::new(),
             cache: Mutex::new(Vec::new()),
+            ignore: ignore.clone(),
+            ignore_effects: effects,
         };
         progress("summaries", 0.95);
         idx.summaries = idx.compute_summaries();
@@ -745,6 +841,25 @@ impl Index {
 
     pub fn content_count(&self) -> usize {
         self.hot.len()
+    }
+
+    /// The ignore rules this index was built with.
+    pub fn ignore_settings(&self) -> &IgnoreSettings {
+        &self.ignore
+    }
+
+    /// What each ignore rule hid, aligned with `ignore_settings().rules`.
+    pub fn ignore_effects(&self) -> &[RuleEffect] {
+        &self.ignore_effects
+    }
+
+    /// Totals hidden by all ignore rules.
+    pub fn ignored_total(&self) -> RuleEffect {
+        self.ignore_effects.iter().fold(RuleEffect::default(), |a, e| RuleEffect {
+            folders: a.folders + e.folders,
+            files: a.files + e.files,
+            bytes: a.bytes + e.bytes,
+        })
     }
 
     pub fn dup_group_count(&self) -> usize {
@@ -1009,13 +1124,24 @@ impl Index {
     // ------------------------------------------------------------------ listings
 
     /// Children of a node, filtered and sorted. Folders without matching files are omitted.
-    pub fn list(&self, db: &Db, node: Node, opts: &ListOptions) -> Result<Listing> {
+    /// Folder rows of a node, filtered and sorted, without touching the database.
+    /// Returns the node's own statistics too.
+    pub fn list_dirs(&self, node: Node, opts: &ListOptions) -> (DirStats, Vec<DirRow>) {
         let roll = self.rollup(&opts.filter);
-        let cf = self.compile(&opts.filter);
+        let row = |c: DirIx, name: String| -> DirRow {
+            let st = roll.stats[c as usize];
+            let kids = self.dir_children(c);
+            let in_kids: u32 = kids.iter().map(|&g| roll.stats[g as usize].files).sum();
+            DirRow {
+                dir: c,
+                name,
+                stats: st,
+                has_subdirs: kids.iter().any(|&g| roll.stats[g as usize].files > 0),
+                direct_files: st.files.saturating_sub(in_kids),
+            }
+        };
         let mut dirs = Vec::new();
-        let mut files = Vec::new();
-        let stats;
-        match node {
+        let stats = match node {
             Node::AllSources => {
                 let mut total = DirStats::default();
                 for s in &self.sources {
@@ -1024,28 +1150,40 @@ impl Index {
                     total.files += st.files;
                     total.dup_files += st.dup_files;
                     if st.files > 0 {
-                        dirs.push(DirRow { dir: s.root, name: s.host.clone(), stats: st, has_subdirs: true });
+                        dirs.push(row(s.root, s.host.clone()));
                     }
                 }
-                stats = total;
+                total
             }
             Node::Dir(d) => {
                 if d as usize >= self.dir_db.len() {
-                    return err(format!("folder {d} does not exist"));
+                    return (DirStats::default(), Vec::new());
                 }
-                stats = roll.stats[d as usize];
                 for &c in self.dir_children(d) {
-                    let st = roll.stats[c as usize];
-                    if st.files > 0 {
-                        let has_subdirs = self.dir_children(c).iter().any(|&g| roll.stats[g as usize].files > 0);
-                        dirs.push(DirRow {
-                            dir: c,
-                            name: self.dir_name[c as usize].to_string(),
-                            stats: st,
-                            has_subdirs,
-                        });
+                    if roll.stats[c as usize].files > 0 {
+                        dirs.push(row(c, self.dir_name[c as usize].to_string()));
                     }
                 }
+                roll.stats[d as usize]
+            }
+        };
+        dirs.sort_by(|a, b| dir_order(a, b, opts));
+        (stats, dirs)
+    }
+
+    /// Children of a node, filtered and sorted. Folders without matching files are omitted.
+    pub fn list(&self, db: &Db, node: Node, opts: &ListOptions) -> Result<Listing> {
+        if let Node::Dir(d) = node {
+            if d as usize >= self.dir_db.len() {
+                return err(format!("folder {d} does not exist"));
+            }
+        }
+        let cf = self.compile(&opts.filter);
+        let (stats, dirs) = self.list_dirs(node, opts);
+        let mut files = Vec::new();
+        match node {
+            Node::AllSources => {}
+            Node::Dir(d) => {
                 let range = self.dir_files(d);
                 if !range.is_empty() {
                     let names = db.visible_file_names(self.dir_db[d as usize])?;
@@ -1075,7 +1213,7 @@ impl Index {
                 }
             }
         }
-        sort_listing(&mut dirs, &mut files, opts);
+        files.sort_by(|a, b| file_order(a, b, opts));
         Ok(Listing { node, stats, dirs, files })
     }
 
@@ -1124,20 +1262,7 @@ impl Index {
 
     /// Duplicate groups, most wasted space first. Returns (total matching groups, page).
     pub fn dup_groups(&self, q: &DupQuery, offset: usize, limit: usize) -> (usize, Vec<DupGroup>) {
-        let inv = q.involving.map(|id| self.source_ix(id));
-        let pass = |c: u32| -> bool {
-            let algo_ok = match q.hash {
-                HashFilter::Any => true,
-                HashFilter::Sha256 => self.hot[c as usize].algo == ALGO_SHA256 as u16,
-                HashFilter::Flagged => self.hot[c as usize].algo != ALGO_SHA256 as u16,
-            };
-            let inv_ok = match inv {
-                None => true,
-                Some(None) => false,
-                Some(Some(s)) => self.copies_in_source(c, s) > 0,
-            };
-            algo_ok && inv_ok && self.copies(c) >= q.min_copies.max(2)
-        };
+        let pass = self.dup_pass(q);
         let mut total = 0usize;
         let mut page = Vec::new();
         for &c in &self.dup_order {
@@ -1159,6 +1284,130 @@ impl Index {
             total += 1;
         }
         (total, page)
+    }
+
+    /// Number of duplicate groups matching a query, and the bytes in their extra copies.
+    pub fn dup_totals(&self, q: &DupQuery) -> (usize, u64) {
+        let pass = self.dup_pass(q);
+        let mut n = 0usize;
+        let mut wasted = 0u64;
+        for &c in &self.dup_order {
+            if pass(c) {
+                n += 1;
+                wasted += self.content_size[c as usize].saturating_mul(self.copies(c) as u64 - 1);
+            }
+        }
+        (n, wasted)
+    }
+
+    fn dup_pass<'a>(&'a self, q: &'a DupQuery) -> impl Fn(u32) -> bool + 'a {
+        let inv = q.involving.map(|id| self.source_ix(id));
+        move |c: u32| -> bool {
+            let h = &self.hot[c as usize];
+            let algo_ok = match q.hash {
+                HashFilter::Any => true,
+                HashFilter::Sha256 => h.algo == ALGO_SHA256 as u16,
+                HashFilter::Flagged => h.algo != ALGO_SHA256 as u16,
+            };
+            let inv_ok = match inv {
+                None => true,
+                Some(None) => false,
+                Some(Some(s)) => self.copies_in_source(c, s) > 0,
+            };
+            let spread_ok = match q.spread {
+                Spread::Any => true,
+                Spread::OneSource => h.src_len == 1,
+                Spread::SeveralSources => h.src_len >= 2,
+            };
+            algo_ok && inv_ok && spread_ok && h.copies >= q.min_copies.max(2)
+        }
+    }
+
+    /// Which sources hold copies of a folder's files outside the folder (the inspector's
+    /// "where are the copies" view), and where in each source they mostly are. Unfiltered: every
+    /// file under the folder counts.
+    pub fn copies_outside(&self, d: DirIx) -> OutsideCopies {
+        let mut out = OutsideCopies::default();
+        if d as usize >= self.dir_db.len() {
+            return out;
+        }
+        let end = self.dir_end[d as usize];
+        let inside = |x: u32| x >= d && x < end;
+        let mut per = vec![(0u64, 0u64); self.sources.len()];
+        // files of this folder that have a copy outside it, by content (a content's outside
+        // copies are the same for all its files here, so each content is walked once)
+        let mut shared: Vec<ContentIx> = Vec::new();
+        for f in self.subtree_files(d) {
+            let size = self.file_size[f as usize];
+            out.files += 1;
+            out.bytes += size;
+            let c = self.file_content[f as usize];
+            let h = &self.hot[c as usize];
+            // all copies in one source and their common folder inside this one: nothing outside
+            let all_inside = h.lca != NONE && inside(h.lca);
+            if h.copies > 1 && !all_inside {
+                shared.push(c);
+            } else {
+                out.alone_files += 1;
+                out.alone_bytes += size;
+            }
+        }
+        shared.sort_unstable();
+        let mut marked_by = vec![u32::MAX; self.sources.len()];
+        // bytes of this folder's files with at least one outside copy under each folder
+        let mut cover = vec![0u64; self.dir_db.len()];
+        let mut cover_mark = vec![u32::MAX; self.dir_db.len()];
+        for run in shared.chunk_by(|a, b| a == b) {
+            let c = run[0];
+            let n = run.len() as u64;
+            let bytes = self.content_size[c as usize] * n;
+            for &g in self.content_files(c) {
+                let gd = self.file_dir[g as usize];
+                if inside(gd) {
+                    continue;
+                }
+                let s = self.dir_source[gd as usize] as usize;
+                if marked_by[s] != c {
+                    marked_by[s] = c;
+                    per[s].0 += n;
+                    per[s].1 += bytes;
+                }
+                // credit the copy's folder and its ancestors, each once per content: stop at the
+                // first one an earlier copy already credited
+                let mut a = gd;
+                while a != NONE && cover_mark[a as usize] != c {
+                    cover_mark[a as usize] = c;
+                    cover[a as usize] += bytes;
+                    a = self.dir_parent[a as usize];
+                }
+            }
+        }
+        out.by_source =
+            per.into_iter().enumerate().filter(|(_, p)| p.0 > 0).map(|(s, p)| (s as SourceIx, p.0, p.1)).collect();
+        out.by_source.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        out.main_dir = out
+            .by_source
+            .iter()
+            .map(|&(s, _, bytes)| {
+                let need = (bytes as f64 * MAIN_SHARE).ceil() as u64;
+                let mut cur = self.sources[s as usize].root;
+                loop {
+                    // the child holding the most, if it holds enough (ties: tree order)
+                    let best = self
+                        .dir_children(cur)
+                        .iter()
+                        .copied()
+                        .filter(|&k| cover[k as usize] >= need && cover[k as usize] > 0)
+                        .max_by(|&a, &b| cover[a as usize].cmp(&cover[b as usize]).then(b.cmp(&a)));
+                    match best {
+                        Some(k) => cur = k,
+                        None => break,
+                    }
+                }
+                (s, cur, cover[cur as usize])
+            })
+            .collect();
+        out
     }
 
     /// Rough heap usage of the index in bytes.
@@ -1265,11 +1514,6 @@ fn file_order(a: &FileRow, b: &FileRow, opts: &ListOptions) -> Ordering {
     };
     let o = if opts.descending { o.reverse() } else { o };
     o.then_with(|| natural_cmp(&a.name, &b.name)).then(a.file.cmp(&b.file))
-}
-
-fn sort_listing(dirs: &mut [DirRow], files: &mut [FileRow], opts: &ListOptions) {
-    dirs.sort_by(|a, b| dir_order(a, b, opts));
-    files.sort_by(|a, b| file_order(a, b, opts));
 }
 
 /// One entry of a listing when folders and files are shown mixed (folders_first = false).

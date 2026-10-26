@@ -5,7 +5,7 @@
 //! Generates manifests, imports them into a database file, builds the index and times what the
 //! app does on start-up and on common interactions. Prints a Markdown table.
 
-use dupemap_core::index::{CopiesFilter, DupQuery, Filter, Index, ListOptions, Node, SortKey};
+use dupemap_core::index::{CopiesFilter, DupQuery, Filter, Index, ListOptions, Node, SortKey, Spread};
 use dupemap_core::synth::{generate, Config};
 use dupemap_core::Db;
 use std::path::{Path, PathBuf};
@@ -218,6 +218,30 @@ fn main() {
     let s = Instant::now();
     let hl = ix.highlight_dirs(groups[0].content);
     t.ms(&format!("highlight folders for a selection ({} folders)", hl.len()), s);
+    let s = Instant::now();
+    let (deep_total, deep) = ix.dup_groups(&DupQuery::default(), total.saturating_sub(200) / 2, 200);
+    t.ms(&format!("duplicate groups: a page of 200 halfway down ({} rows)", deep.len()), s);
+    assert_eq!(deep_total, total);
+    let s = Instant::now();
+    let across = ix.dup_totals(&DupQuery { spread: Spread::SeveralSources, ..Default::default() });
+    t.ms(&format!("duplicate groups across sources: count and extra bytes ({} groups)", across.0), s);
+
+    // the inspector's "where are the copies" for a folder; the biggest folders are the slowest
+    let mut slowest = (0.0f64, 0u64, String::new());
+    let mut biggest_dirs: Vec<u32> = ix.sources().iter().map(|s| s.root).collect();
+    biggest_dirs.extend(ix.sources().iter().flat_map(|s| ix.dir_children(s.root).iter().copied()));
+    for d in biggest_dirs {
+        let s = Instant::now();
+        let o = ix.copies_outside(d);
+        let ms = s.elapsed().as_secs_f64() * 1000.0;
+        if ms > slowest.0 {
+            slowest = (ms, o.files, ix.dir_path(d));
+        }
+    }
+    t.add(
+        "inspector: where a folder's copies are, slowest source or drive",
+        format!("{:.1} ms ({} files)", slowest.0, slowest.1),
+    );
 
     drop(ix);
     drop(db);

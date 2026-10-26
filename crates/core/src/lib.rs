@@ -7,6 +7,7 @@
 
 pub mod db;
 pub mod error;
+pub mod ignore;
 pub mod index;
 pub mod manifest;
 pub mod natsort;
