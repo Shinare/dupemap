@@ -75,6 +75,14 @@ target\release\dupemap-gen --out C:\tmp\gen --rows 1000000
 target\release\dupemap-bench --rows 1000000
 ```
 
+To check real manifests end to end (every path reproduced exactly, copy counts equal a plain
+group-by of hash and size), point the optional test at a folder of them; nothing is committed:
+
+```
+set DUPEMAP_REAL_MANIFESTS=C:\Hashes
+cargo test --release --test real_manifests -- --nocapture
+```
+
 `dupemap-gen` writes eight manifests that mimic three PCs, USB drives (scanned twice), a TrueNAS
 box with two pools, Google Drive and OneDrive, with awkward names and deliberate bad lines, plus
 `expected.json` describing what an import should report.

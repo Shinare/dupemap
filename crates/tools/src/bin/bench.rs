@@ -11,8 +11,45 @@ use dupemap_core::Db;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// (current, peak) resident memory in bytes. On Windows: working set and peak working set.
+#[cfg(windows)]
 fn rss() -> (Option<u64>, Option<u64>) {
-    // (current, peak) in bytes; Linux only
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+    // SAFETY: plain Win32 calls with a correctly sized, zero-initialised output struct.
+    unsafe {
+        let mut c: ProcessMemoryCounters = std::mem::zeroed();
+        c.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) == 0 {
+            return (None, None);
+        }
+        (Some(c.working_set_size as u64), Some(c.peak_working_set_size as u64))
+    }
+}
+
+/// (current, peak) resident memory in bytes, from /proc on Linux.
+#[cfg(not(windows))]
+fn rss() -> (Option<u64>, Option<u64>) {
     let Ok(s) = std::fs::read_to_string("/proc/self/status") else { return (None, None) };
     let field = |name: &str| -> Option<u64> {
         s.lines()
