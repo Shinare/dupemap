@@ -47,6 +47,8 @@ target\release\DupeMap.exe
   its files have another copy. *Elsewhere* — for a file, copies in **other** sources; for a folder,
   the share of its bytes that also exist outside it (✔ all = every file has a copy outside).
   Unique files are dimmed. Sort by Name or Size by clicking the header; drag header edges to resize.
+  A narrow tab (split views, small screens) drops columns to keep the names readable: Files first,
+  then Copies, then Elsewhere; the inspector and tooltips still show everything.
 * **Keyboard**: ↑ ↓ PgUp PgDn Home End move, → expands, ← collapses or goes to the parent,
   Enter toggles, Ctrl+C copies the path. Ctrl+G opens the duplicate groups, Ctrl+I shows or hides
   the inspector.
@@ -88,8 +90,8 @@ or remote session without GPU drivers, copy `opengl32.dll` and `libgallium_wgl.d
 
 The database lives in `%LOCALAPPDATA%\DupeMap\dupemap.db`; `DupeMap.exe --db D:\other.db` uses
 another one. `DupeMap.exe --db C:\tmp\demo.db --demo 1000000` fills a separate database with
-generated demo data. The app reads manifests only; it has no network access and never deletes
-anything.
+generated demo data, and `--window 1024x768` opens the window at that size (to try small
+screens). The app reads manifests only; it has no network access and never deletes anything.
 
 ## Try it on your manifests (command line)
 

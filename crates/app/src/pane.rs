@@ -53,7 +53,12 @@ impl Default for Widths {
 }
 
 /// Narrowest Size, Files, Copies and Elsewhere columns: the number still fits, the bar goes.
-const MIN_W: [f32; 4] = [76.0, 52.0, 56.0, 72.0];
+const MIN_W: [f32; 4] = [70.0, 60.0, 60.0, 72.0];
+/// Number columns a pane too narrow for all of them gives up, in this order (Files, Copies,
+/// Elsewhere); the name keeps at least `NAME_MIN`.
+const DROP_ORDER: [usize; 3] = [1, 2, 3];
+/// Narrowest indentation per folder level.
+const INDENT_MIN: f32 = 6.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TreePane {
@@ -78,6 +83,8 @@ struct View {
     scroll_to: Option<f32>,
     /// A row to bring into view once it is listed (after a reveal); frames left to wait for it.
     pending_reveal: Option<(Sel, u16)>,
+    /// Depth of the deepest listed row (sets the indentation in narrow panes).
+    max_depth: u16,
 }
 
 /// What a pane needs from the app while drawing.
@@ -112,6 +119,14 @@ struct Cols {
     files: Rangef,
     copies: Rangef,
     elsewhere: Rangef,
+    /// Which of Size, Files, Copies and Elsewhere fit: a narrow pane drops Files first, then
+    /// Copies, then Elsewhere (see `DROP_ORDER`). Size always stays.
+    shown: [bool; 4],
+    /// Indentation per folder level: narrower when deep folders would leave no room for names.
+    indent: f32,
+    /// The number columns are wider than their minimum, so dragging their edges changes
+    /// something (in a narrow pane they are pinned at the minimum and the names get the rest).
+    adjustable: bool,
 }
 
 impl TreePane {
@@ -216,6 +231,7 @@ impl TreePane {
         for d in missing.into_inner() {
             files.request(worker, d, opts);
         }
+        self.view.max_depth = rows.iter().map(|r| r.depth).max().unwrap_or(0);
         self.view.rows = rows;
         self.view.files = used.into_inner();
         self.view.key = Some((generation, files.version, self.view.version));
@@ -334,16 +350,19 @@ impl TreePane {
     }
 
     fn toolbar(&mut self, ui: &mut Ui, ix: &Index, cx: &mut PaneCtx, ev: &mut Vec<Event>) {
-        ui.horizontal(|ui| {
+        // a narrow pane puts the totals on their own line and lets the controls wrap
+        let narrow = ui.available_width() < 640.0;
+        let controls = |this: &mut Self, ui: &mut Ui, ev: &mut Vec<Event>, cx: &mut PaneCtx| {
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Source").color(colors::INK_MUTED));
-            let current = self.title(Some(ix));
+            let current = this.title(Some(ix));
             egui::ComboBox::from_id_salt(("root", cx.pane_id))
                 .selected_text(current)
-                .width(240.0)
+                .width((ui.available_width() - 190.0).clamp(110.0, 240.0))
                 .height(480.0)
+                .truncate()
                 .show_ui(ui, |ui| {
-                    if ui.selectable_label(self.root == Root::AllSources, "All sources").clicked() {
+                    if ui.selectable_label(this.root == Root::AllSources, "All sources").clicked() {
                         ev.push(Event::Root(Root::AllSources));
                     }
                     ui.separator();
@@ -356,47 +375,68 @@ impl TreePane {
                         );
                         let alert = cx.alert_hosts.contains(&s.host);
                         let label = if alert { format!("⚠ {text}") } else { text };
-                        if ui.selectable_label(self.root == Root::Source(s.db_id), label).clicked() {
+                        if ui.selectable_label(this.root == Root::Source(s.db_id), label).clicked() {
                             ev.push(Event::Root(Root::Source(s.db_id)));
                         }
                     }
                 });
-            self.filter_button(ui, ix, cx, ev);
+            this.filter_button(ui, ix, cx, ev, narrow);
             if ui.button("Collapse all").on_hover_text("Collapse every folder in this tab").clicked() {
                 ev.push(Event::CollapseAll);
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        };
+        let st = self.root_stats(ix);
+        let pct = if st.files > 0 { st.dup_files as f64 * 100.0 / st.files as f64 } else { 0.0 };
+        let summary = format!(
+            "{} · {} · {} with copies ({})",
+            format::plural(st.files as u64, "file", "files"),
+            format::bytes(st.bytes),
+            format::count(st.dup_files as u64),
+            format::percent(pct)
+        );
+        let pending = cx.files.is_pending();
+        let totals = |ui: &mut Ui| {
+            // cut, never overlap the buttons
+            ui.add(egui::Label::new(egui::RichText::new(&summary).color(colors::INK_SECONDARY)).truncate())
+                .on_hover_text(&summary);
+            if pending {
+                ui.add(egui::Spinner::new().size(12.0));
+            }
+        };
+        if narrow {
+            ui.horizontal_wrapped(|ui| controls(self, ui, ev, cx));
+            ui.horizontal(|ui| {
                 ui.add_space(6.0);
-                let st = self.root_stats(ix);
-                let pct = if st.files > 0 { st.dup_files as f64 * 100.0 / st.files as f64 } else { 0.0 };
-                let summary = format!(
-                    "{} · {} · {} with copies ({})",
-                    format::plural(st.files as u64, "file", "files"),
-                    format::bytes(st.bytes),
-                    format::count(st.dup_files as u64),
-                    format::percent(pct)
-                );
-                // cut, never overlap the buttons, when the pane is narrow
-                ui.add(egui::Label::new(egui::RichText::new(&summary).color(colors::INK_SECONDARY)).truncate())
-                    .on_hover_text(summary);
-                if cx.files.is_pending() {
-                    ui.add(egui::Spinner::new().size(12.0));
-                }
+                totals(ui);
             });
-        });
+        } else {
+            ui.horizontal(|ui| {
+                controls(self, ui, ev, cx);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    totals(ui);
+                });
+            });
+        }
     }
 
     /// The filter button: a popup to choose which files this tab shows. Folder totals are then
     /// computed over the matching files only (copies are always counted over everything).
-    fn filter_button(&mut self, ui: &mut Ui, ix: &Index, cx: &mut PaneCtx, ev: &mut Vec<Event>) {
+    fn filter_button(&mut self, ui: &mut Ui, ix: &Index, cx: &mut PaneCtx, ev: &mut Vec<Event>, narrow: bool) {
         let f = &self.opts.filter;
         let active = !f.is_all();
-        let label = if active { format!("Filter: {}", filter_summary(ix, f)) } else { "Filter".to_string() };
+        // a narrow pane shows only that a filter is on (the button is filled); the hover says which
+        let label = if active && !narrow { format!("Filter: {}", filter_summary(ix, f)) } else { "Filter".to_string() };
         let mut button = egui::Button::new(egui::RichText::new(label).color(colors::INK)).truncate();
         if active {
             button = button.fill(colors::SELECTION);
         }
-        let resp = ui.add(button).on_hover_text("Choose which files this tab shows");
+        let tip = if active {
+            format!("Showing: {}\nClick to change which files this tab shows", filter_summary(ix, f))
+        } else {
+            "Choose which files this tab shows".to_string()
+        };
+        let resp = ui.add(button).on_hover_text(tip);
         let mut new = f.clone();
         egui::Popup::from_toggle_button_response(&resp)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -460,17 +500,39 @@ impl TreePane {
     }
 
     fn columns(&self, left: f32, right: f32) -> Cols {
+        let width = right - left;
+        // drop number columns the pane has no room for, least important first
+        let mut shown = [true; 4];
+        for &k in &DROP_ORDER {
+            let need: f32 = NAME_MIN + (0..4).filter(|&i| shown[i]).map(|i| MIN_W[i]).sum::<f32>();
+            if need <= width {
+                break;
+            }
+            shown[k] = false;
+        }
         let w = &self.widths;
         let mut fixed = [w.size, w.files, w.copies, w.elsewhere];
+        let mut min = MIN_W;
+        for i in 0..4 {
+            if !shown[i] {
+                fixed[i] = 0.0;
+                min[i] = 0.0;
+            }
+        }
         // names keep half of a narrow pane (split views) unless the numbers would no longer fit.
         // The other columns shrink: first the two with bars (a bar gives way before any number
-        // does), then all four to their minimum, then evenly.
-        let width = right - left;
-        let name_min = NAME_MIN.max((width * 0.5).min(width - MIN_W.iter().sum::<f32>()));
-        let avail = (right - left - name_min).max(0.0);
-        let bars_first = [MIN_W[0], fixed[1], fixed[2], MIN_W[3]];
+        // does), then all of them to their minimum, then evenly.
+        let min_sum: f32 = min.iter().sum();
+        // once a column had to go, every spare pixel goes to the names
+        let name_min = if shown.iter().all(|&v| v) {
+            NAME_MIN.max((width * 0.5).min(width - min_sum))
+        } else {
+            NAME_MIN.max(width - min_sum)
+        };
+        let avail = (width - name_min).max(0.0);
+        let bars_first = [min[0], fixed[1], fixed[2], min[3]];
         if widgets::shrink_columns(&mut fixed, &bars_first, avail) > 0.0
-            && widgets::shrink_columns(&mut fixed, &MIN_W, avail) > 0.0
+            && widgets::shrink_columns(&mut fixed, &min, avail) > 0.0
         {
             widgets::scale_columns(&mut fixed, avail);
         }
@@ -484,6 +546,9 @@ impl TreePane {
             files: Rangef::new(f0, c0),
             copies: Rangef::new(c0, e0),
             elsewhere: Rangef::new(e0, right),
+            shown,
+            indent: INDENT,
+            adjustable: shown.iter().all(|&v| v) && fixed.iter().sum::<f32>() > MIN_W.iter().sum::<f32>() + 0.5,
         }
     }
 
@@ -493,7 +558,10 @@ impl TreePane {
         let bar = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
         // never wider than what is visible (a wide toolbar must not push columns off screen)
         let full = ui.available_rect_before_wrap().intersect(ui.clip_rect());
-        let cols = self.columns(full.left(), full.right() - bar);
+        let mut cols = self.columns(full.left(), full.right() - bar);
+        // deep folders in a narrow pane: indent less, so the names keep some room
+        let levels = self.view.max_depth.max(1) as f32;
+        cols.indent = (cols.name.span() * 0.35 / levels).clamp(INDENT_MIN, INDENT);
 
         // header
         let (hrect, _) = ui.allocate_exact_size(Vec2::new(full.width(), HEADER_H), Sense::hover());
@@ -532,6 +600,9 @@ impl TreePane {
             ("Elsewhere", cols.elsewhere, None, true, "Files: copies in other sources (other machines, drives or cloud).\nFolders: share of the bytes that also exist outside the folder; ✔ when every file has a copy outside it."),
         ];
         for (i, (title, x, sort, right, tip)) in titles.into_iter().enumerate() {
+            if i > 0 && !cols.shown[i - 1] {
+                continue;
+            }
             let cell = Rect::from_x_y_ranges(x, rect.y_range());
             let id = ui.id().with(("hdr", pane_id, i));
             let resp = ui.interact(cell, id, if sort.is_some() { Sense::CLICK } else { Sense::hover() });
@@ -580,12 +651,19 @@ impl TreePane {
                 }
             }
         }
-        // resize handles on the four column boundaries
+        // resize handles on the left edge of each shown number column. A narrow pane keeps the
+        // numbers at their minimum and gives the rest to the names, so there is nothing to drag:
+        // the lines stay, the handles go.
+        let draggable = cols.adjustable;
         let bounds = [cols.size.min, cols.files.min, cols.copies.min, cols.elsewhere.min];
         for (b, x) in bounds.into_iter().enumerate() {
+            if !cols.shown[b] {
+                continue;
+            }
             let handle = Rect::from_x_y_ranges(Rangef::new(x - 3.0, x + 3.0), rect.y_range());
-            let resp = ui.interact(handle, ui.id().with(("resize", pane_id, b)), Sense::drag());
-            let hot = resp.hovered() || resp.dragged();
+            let sense = if draggable { Sense::drag() } else { Sense::hover() };
+            let resp = ui.interact(handle, ui.id().with(("resize", pane_id, b)), sense);
+            let hot = draggable && (resp.hovered() || resp.dragged());
             p.line_segment(
                 [Pos2::new(x, rect.top() + 5.0), Pos2::new(x, rect.bottom() - 5.0)],
                 Stroke::new(1.0, if hot { colors::INK_SECONDARY } else { colors::GRID }),
@@ -595,28 +673,30 @@ impl TreePane {
             }
             if resp.dragged() {
                 let dx = resp.drag_delta().x;
-                self.resize(b, dx);
+                self.resize(b, dx, cols.shown);
             }
         }
     }
 
     /// Move column boundary `b` (0 = name|size … 3 = copies|elsewhere) by `dx`.
-    fn resize(&mut self, b: usize, dx: f32) {
+    fn resize(&mut self, b: usize, dx: f32, shown: [bool; 4]) {
         let w = &mut self.widths;
         let mut arr = [w.size, w.files, w.copies, w.elsewhere];
-        // the boundary is the left edge of column b; columns to its right keep the right edge
+        // the boundary is the left edge of column b; columns to its right keep the right edge,
+        // the nearest shown column to its left (or the name) gives or takes the width
         let grow = -dx;
         let new_b = (arr[b] + grow).max(MIN_W[b]);
         let delta = new_b - arr[b];
-        if b == 0 {
-            arr[0] = new_b;
-        } else {
-            let left = arr[b - 1] - delta;
-            if left < MIN_W[b - 1] {
-                return;
+        match (0..b).rev().find(|&k| shown[k]) {
+            None => arr[b] = new_b,
+            Some(k) => {
+                let left = arr[k] - delta;
+                if left < MIN_W[k] {
+                    return;
+                }
+                arr[k] = left;
+                arr[b] = new_b;
             }
-            arr[b - 1] = left;
-            arr[b] = new_b;
         }
         *w = Widths { size: arr[0], files: arr[1], copies: arr[2], elsewhere: arr[3] };
     }
@@ -689,7 +769,7 @@ impl TreePane {
         }
         let font = FontId::proportional(13.0);
         let small = FontId::proportional(11.5);
-        let x = cols.name.min + PAD + row.depth as f32 * INDENT;
+        let x = cols.name.min + PAD + row.depth as f32 * cols.indent;
         let exp_rect = Rect::from_min_size(Pos2::new(x - 2.0, rect.top()), Vec2::new(INDENT + 2.0, ROW_H));
         let icon_rect = Rect::from_min_size(Pos2::new(x + INDENT, rect.top()), Vec2::new(16.0, ROW_H));
         let name_left = x + INDENT + 20.0;
@@ -740,25 +820,26 @@ impl TreePane {
                     widgets::text_left(&p, name_rect, ix.dir_name(dir), font.clone(), colors::INK);
                 }
                 size_cell(&p, cols.size, rect, st.bytes, row.parent_bytes, false);
-                widgets::text_right(
-                    &p,
-                    inner(cols.files, rect),
-                    &format::count(st.files as u64),
-                    font.clone(),
-                    colors::INK_SECONDARY,
-                );
-                if st.dup_files > 0 {
+                if cols.shown[1] {
                     widgets::text_right(
                         &p,
-                        inner(cols.copies, rect),
-                        &format::count(st.dup_files as u64),
+                        inner(cols.files, rect),
+                        &format::count(st.files as u64),
                         font.clone(),
                         colors::INK_SECONDARY,
                     );
-                } else {
-                    widgets::text_right(&p, inner(cols.copies, rect), "–", font.clone(), colors::INK_MUTED);
                 }
-                elsewhere_dir_cell(&p, cols.elsewhere, rect, &st, small.clone());
+                if cols.shown[2] {
+                    let (text, ink) = if st.dup_files > 0 {
+                        (format::count(st.dup_files as u64), colors::INK_SECONDARY)
+                    } else {
+                        ("–".to_string(), colors::INK_MUTED)
+                    };
+                    widgets::text_right(&p, inner(cols.copies, rect), &text, font.clone(), ink);
+                }
+                if cols.shown[3] {
+                    elsewhere_dir_cell(&p, cols.elsewhere, rect, &st, small.clone());
+                }
 
                 let resp = resp.on_hover_ui(|ui| dir_tooltip(ui, ix, dir, &st));
                 if resp.clicked() {
@@ -805,16 +886,19 @@ impl TreePane {
                 }
                 widgets::text_left(&p, nr, &f.name, font.clone(), ink);
                 size_cell(&p, cols.size, rect, f.size, row.parent_bytes, unique);
-                let fill = colors::copies_fill(f.copies);
-                widgets::pill(
-                    &p,
-                    Pos2::new(cols.copies.max - PAD, rect.center().y),
-                    &format::count(f.copies as u64),
-                    fill,
-                    small.clone(),
-                );
+                if cols.shown[2] {
+                    widgets::pill(
+                        &p,
+                        Pos2::new(cols.copies.max - PAD, rect.center().y),
+                        &format::count(f.copies as u64),
+                        colors::copies_fill(f.copies),
+                        small.clone(),
+                    );
+                }
                 let er = inner(cols.elsewhere, rect);
-                if f.copies_other_sources == 0 {
+                if !cols.shown[3] {
+                    // no room for the column
+                } else if f.copies_other_sources == 0 {
                     // unique, or its copies are all in this source (the Copies pill tells which)
                     widgets::text_right(&p, er, "–", font.clone(), colors::INK_MUTED);
                 } else {
@@ -1323,9 +1407,17 @@ mod tests {
         let c = p.columns(0.0, 1000.0);
         assert_eq!(c.elsewhere.max, 1000.0);
         assert!((c.name.max - (1000.0 - 170.0 - 78.0 - 76.0 - 170.0)).abs() < 0.01);
-        // narrow window: fixed columns shrink so the name keeps its minimum
+        // narrow window: Files goes first, so the name keeps its minimum
         let c = p.columns(0.0, 400.0);
         assert!(c.name.span() >= NAME_MIN - 0.01);
+        assert_eq!(c.shown, [true, false, true, true]);
+        assert_eq!(c.files.span(), 0.0);
+        assert!(!c.adjustable, "nothing to drag when the numbers are at their minimum");
+        assert!(p.columns(0.0, 1000.0).adjustable);
+        // narrower: then Copies, then Elsewhere; Size always stays
+        assert_eq!(p.columns(0.0, 300.0).shown, [true, false, false, true]);
+        assert_eq!(p.columns(0.0, 200.0).shown, [true, false, false, false]);
+        assert!(p.columns(0.0, 200.0).size.span() > 0.0);
         // narrow: the bar columns shrink first, so Files and Copies keep their width longer
         let c = p.columns(0.0, 760.0);
         assert!(
@@ -1340,20 +1432,26 @@ mod tests {
         assert_eq!(c.elsewhere.max, 720.0);
         // a third of a small screen: about half for the name, and the numbers keep their minimum
         let c = p.columns(0.0, 500.0);
-        assert!(c.name.span() >= 240.0);
+        assert_eq!(c.shown, [true; 4]);
+        assert!(c.name.span() >= 235.0);
         assert!(c.files.span() >= MIN_W[1] - 0.01 && c.copies.span() >= MIN_W[2] - 0.01);
         // dragging the name|size boundary left widens Size only
-        p.resize(0, -30.0);
+        p.resize(0, -30.0, [true; 4]);
         assert_eq!(p.widths.size, 200.0);
         assert_eq!(p.widths.files, 78.0);
         // dragging files|copies right moves width from Copies to Files
-        p.resize(2, 10.0);
+        p.resize(2, 10.0, [true; 4]);
         assert_eq!((p.widths.files, p.widths.copies), (88.0, 66.0));
         // never below the minimum
-        p.resize(3, 1000.0);
+        p.resize(3, 1000.0, [true; 4]);
         assert_eq!(p.widths.elsewhere, MIN_W[3]);
         let before = p.widths.clone();
-        p.resize(1, -1000.0);
+        p.resize(1, -1000.0, [true; 4]);
         assert_eq!(p.widths, before, "a drag that would crush the left neighbour is ignored");
+        // with Files hidden, the Size|Copies boundary trades width between Size and Copies
+        let before = p.widths.clone();
+        p.resize(2, 10.0, [true, false, true, true]);
+        assert_eq!(p.widths.files, before.files);
+        assert_eq!((p.widths.size, p.widths.copies), (before.size + 10.0, before.copies - 10.0));
     }
 }

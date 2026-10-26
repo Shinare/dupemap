@@ -918,10 +918,12 @@ impl eframe::App for DupeMapApp {
 
         let has_data = self.index.as_ref().is_some_and(|ix| !ix.sources().is_empty()) || !self.manifests.is_empty();
         if self.inspector.open && has_data {
+            // about a quarter of a small window, at most 400 px; resizable
+            let default = (ui.available_width() * 0.28).clamp(260.0, 400.0);
             egui::Panel::right("inspector")
                 .resizable(true)
-                .default_size(400.0)
-                .size_range(280.0..=760.0)
+                .default_size(default)
+                .size_range(240.0..=760.0)
                 .frame(
                     egui::Frame::new()
                         .fill(colors::PANEL)

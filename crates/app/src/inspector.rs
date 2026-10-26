@@ -109,20 +109,26 @@ fn file_ui(ui: &mut Ui, ix: &Index, f: &FileInfo, actions: &mut Vec<Action>) {
         )
     };
     ui.label(RichText::new(format!("{} · {copies}", format::bytes(f.size))).color(colors::INK_SECONDARY));
-    ui.horizontal(|ui| {
-        let algo = if f.flagged { f.algo.to_uppercase() } else { "SHA-256".to_string() };
-        ui.label(RichText::new(algo).small().color(colors::INK_MUTED));
-        let shown = f.hash.rsplit(':').next().unwrap_or(&f.hash);
-        let short = if shown.len() > 20 {
-            format!("{}…{}", &shown[..10], &shown[shown.len() - 8..])
-        } else {
-            shown.to_string()
-        };
-        ui.label(RichText::new(short).monospace().color(colors::INK_SECONDARY)).on_hover_text(&f.hash);
-        if ui.small_button("Copy hash").clicked() {
-            actions.push(Action::CopyText(shown.to_string()));
-        }
-    });
+    let shown = f.hash.rsplit(':').next().unwrap_or(&f.hash);
+    // rows with a button on the right: the text on the left gives way in a narrow panel
+    egui::Sides::new().shrink_left().truncate().show(
+        ui,
+        |ui| {
+            let algo = if f.flagged { f.algo.to_uppercase() } else { "SHA-256".to_string() };
+            ui.label(RichText::new(algo).small().color(colors::INK_MUTED));
+            let short = if shown.len() > 20 {
+                format!("{}…{}", &shown[..10], &shown[shown.len() - 8..])
+            } else {
+                shown.to_string()
+            };
+            ui.label(RichText::new(short).monospace().color(colors::INK_SECONDARY)).on_hover_text(&f.hash);
+        },
+        |ui| {
+            if ui.small_button("Copy hash").clicked() {
+                actions.push(Action::CopyText(shown.to_string()));
+            }
+        },
+    );
     if f.flagged {
         widgets::status_label(
             ui,
@@ -151,19 +157,22 @@ fn file_ui(ui: &mut Ui, ix: &Index, f: &FileInfo, actions: &mut Vec<Action>) {
 
 fn source_header(ui: &mut Ui, ix: &Index, s: u16, n: usize) {
     let src = &ix.sources()[s as usize];
-    ui.horizontal(|ui| {
-        let kind = match src.kind {
-            PathKind::Windows => "Windows",
-            PathKind::Posix => "Linux / NAS",
-            PathKind::Cloud => "Cloud",
-            PathKind::Relative => "Other",
-        };
-        ui.label(RichText::new(format::host(&src.host)).strong().color(colors::INK));
-        ui.label(RichText::new(kind).small().color(colors::INK_MUTED));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    let kind = match src.kind {
+        PathKind::Windows => "Windows",
+        PathKind::Posix => "Linux / NAS",
+        PathKind::Cloud => "Cloud",
+        PathKind::Relative => "Other",
+    };
+    egui::Sides::new().shrink_left().truncate().show(
+        ui,
+        |ui| {
+            ui.label(RichText::new(format::host(&src.host)).strong().color(colors::INK));
+            ui.label(RichText::new(kind).small().color(colors::INK_MUTED));
+        },
+        |ui| {
             ui.label(RichText::new(format::plural(n as u64, "copy", "copies")).color(colors::INK_SECONDARY));
-        });
-    });
+        },
+    );
 }
 
 fn location_row(ui: &mut Ui, l: &Location, selected: bool, on_this_pc: bool, actions: &mut Vec<Action>) {
@@ -180,7 +189,7 @@ fn location_row(ui: &mut Ui, l: &Location, selected: bool, on_this_pc: bool, act
                 }
                 ui.add(egui::Label::new(RichText::new(&l.path).color(colors::INK)).wrap());
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Show").on_hover_text("Open this copy in a tab").clicked() {
                     actions.push(Action::ShowInTab(l.file));
                 }
@@ -203,12 +212,17 @@ fn dir_ui(ui: &mut Ui, ix: &Index, d: &DirInfo, actions: &mut Vec<Action>) {
     ui.label(RichText::new(name).size(16.0).color(colors::INK));
     if !is_source {
         ui.add(egui::Label::new(RichText::new(&d.path).color(colors::INK_MUTED)).wrap());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("in {}", format::host(&src.host))).small().color(colors::INK_MUTED));
-            if ui.small_button("Copy path").clicked() {
-                actions.push(Action::CopyText(d.path.clone()));
-            }
-        });
+        egui::Sides::new().shrink_left().truncate().show(
+            ui,
+            |ui| {
+                ui.label(RichText::new(format!("in {}", format::host(&src.host))).small().color(colors::INK_MUTED));
+            },
+            |ui| {
+                if ui.small_button("Copy path").clicked() {
+                    actions.push(Action::CopyText(d.path.clone()));
+                }
+            },
+        );
     }
     ui.add_space(6.0);
     let st = &d.stats;
@@ -247,26 +261,30 @@ fn dir_ui(ui: &mut Ui, ix: &Index, d: &DirInfo, actions: &mut Vec<Action>) {
         share_row(ui, &label, files, bytes, bytes as f32 / total as f32, colors::DUP);
         // where in that source: the deepest folder holding (nearly) all of these copies
         if let Some(&(_, main, held)) = o.main_dir.get(i) {
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                if crate::selection::names_a_place(ix, main) {
-                    let share = if bytes > 0 { held as f64 * 100.0 / bytes as f64 } else { 0.0 };
-                    let what = if share >= 99.95 {
-                        "all under".to_string()
-                    } else {
-                        format!("{} under", format::percent(share))
-                    };
-                    ui.label(RichText::new(what).small().color(colors::INK_MUTED));
-                    let path = ix.dir_path(main);
-                    ui.add(egui::Label::new(RichText::new(&path).small().color(colors::INK_SECONDARY)).truncate())
-                        .on_hover_text(&path);
-                    if ui.small_button("Show").on_hover_text("Open this folder in a tab").clicked() {
-                        actions.push(Action::ShowDirInTab(main));
-                    }
-                } else {
+            if crate::selection::names_a_place(ix, main) {
+                let share = if bytes > 0 { held as f64 * 100.0 / bytes as f64 } else { 0.0 };
+                let what =
+                    if share >= 99.95 { "all under".to_string() } else { format!("{} under", format::percent(share)) };
+                let path = ix.dir_path(main);
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(what).small().color(colors::INK_MUTED));
+                        ui.label(RichText::new(&path).small().color(colors::INK_SECONDARY)).on_hover_text(&path);
+                    },
+                    |ui| {
+                        if ui.small_button("Show").on_hover_text("Open this folder in a tab").clicked() {
+                            actions.push(Action::ShowDirInTab(main));
+                        }
+                    },
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
                     ui.label(RichText::new("spread over the whole source").small().color(colors::INK_MUTED));
-                }
-            });
+                });
+            }
         }
         ui.add_space(2.0);
     }

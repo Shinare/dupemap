@@ -38,8 +38,16 @@ fn default_db_path() -> PathBuf {
     base.unwrap_or_else(|| PathBuf::from(".")).join("dupemap.db")
 }
 
-fn parse_args() -> Result<app::Options, String> {
+/// Window size in logical pixels: `--window 1024x768` (for trying small screens).
+fn parse_size(v: &str) -> Option<[f32; 2]> {
+    let (w, h) = v.split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?);
+    (w >= 400.0 && h >= 300.0).then_some([w, h])
+}
+
+fn parse_args() -> Result<(app::Options, [f32; 2]), String> {
     let mut opts = app::Options { db_path: default_db_path(), demo_rows: None, screenshot: None };
+    let mut size = [1440.0, 900.0];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -49,11 +57,15 @@ fn parse_args() -> Result<app::Options, String> {
                 opts.demo_rows = Some(n.replace(['_', ','], "").parse().map_err(|_| format!("bad row count: {n}"))?);
             }
             "--screenshot" => opts.screenshot = Some(PathBuf::from(args.next().ok_or("--screenshot needs a file")?)),
+            "--window" => {
+                let v = args.next().ok_or("--window needs a size like 1024x768")?;
+                size = parse_size(&v).ok_or(format!("bad window size: {v}"))?;
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    Ok(opts)
+    Ok((opts, size))
 }
 
 /// The window icon: two overlapping documents (blue = size, orange = copies), drawn at startup.
@@ -105,13 +117,13 @@ fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
-    let opts = match parse_args() {
+    let (opts, size) = match parse_args() {
         Ok(o) => o,
         Err(e) => {
             if !e.is_empty() {
                 eprintln!("{e}");
             }
-            eprintln!("usage: DupeMap [--db <path>] [--demo <rows>]");
+            eprintln!("usage: DupeMap [--db <path>] [--demo <rows>] [--window <width>x<height>]");
             std::process::exit(if e.is_empty() { 0 } else { 2 });
         }
     };
@@ -119,10 +131,23 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("DupeMap")
             .with_app_id("dupemap")
-            .with_inner_size([1440.0, 900.0])
+            .with_inner_size(size)
             .with_min_inner_size([760.0, 440.0])
             .with_icon(icon()),
         ..Default::default()
     };
     eframe::run_native("DupeMap", native, Box::new(move |cc| Ok(Box::new(app::DupeMapApp::new(cc, opts)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_sizes() {
+        assert_eq!(parse_size("1024x768"), Some([1024.0, 768.0]));
+        assert_eq!(parse_size("1366 X 768"), Some([1366.0, 768.0]));
+        assert_eq!(parse_size("10x10"), None);
+        assert_eq!(parse_size("wide"), None);
+    }
 }

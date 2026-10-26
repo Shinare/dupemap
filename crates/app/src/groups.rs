@@ -142,6 +142,9 @@ struct Cols {
     copies: Rangef,
     sources: Rangef,
     wasted: Rangef,
+    /// Which of Each, Copies, Sources and Extra copies fit: a narrow tab drops Sources first,
+    /// then Each, then Copies. Extra copies always stays.
+    shown: [bool; 4],
 }
 
 impl Default for GroupsPane {
@@ -205,74 +208,85 @@ impl GroupsPane {
 
     fn toolbar(&mut self, ui: &mut Ui, cx: &mut GroupsCtx) {
         let ix = cx.ix.clone();
-        // two rows in a narrow tab, so nothing is pushed off screen
-        let narrow = ui.available_width() < 600.0;
         let q = &mut self.query;
         let pane = cx.pane_id;
-        let first = |ui: &mut Ui, q: &mut DupQuery| {
-            let inv_text = match q.involving.and_then(|id| ix.source_ix(id)) {
-                Some(s) => format!("With a copy in {}", format::host(&ix.sources()[s as usize].host)),
-                None => "Any source".into(),
-            };
-            egui::ComboBox::from_id_salt(("g-inv", pane)).selected_text(inv_text).width(200.0).height(420.0).show_ui(
-                ui,
-                |ui| {
-                    ui.selectable_value(&mut q.involving, None, "Any source");
-                    for s in ix.sources() {
-                        ui.selectable_value(
-                            &mut q.involving,
-                            Some(s.db_id),
-                            format!("With a copy in {}", format::host(&s.host)),
-                        );
-                    }
-                },
-            );
-            let spread_text = match q.spread {
-                Spread::Any => "Anywhere",
-                Spread::OneSource => "Within one source",
-                Spread::SeveralSources => "Across sources",
-            };
-            egui::ComboBox::from_id_salt(("g-spread", pane)).selected_text(spread_text).width(140.0).show_ui(
-                ui,
-                |ui| {
-                    ui.selectable_value(&mut q.spread, Spread::Any, "Anywhere");
-                    ui.selectable_value(&mut q.spread, Spread::OneSource, "Within one source")
-                        .on_hover_text("Every copy is on the same machine, drive or cloud account");
-                    ui.selectable_value(&mut q.spread, Spread::SeveralSources, "Across sources")
-                        .on_hover_text("Copies on two or more machines, drives or cloud accounts");
-                },
-            );
-        };
-        let second = |ui: &mut Ui, q: &mut DupQuery| {
-            let copies_text = format!("{}+ copies", q.min_copies.max(2));
-            egui::ComboBox::from_id_salt(("g-min", pane)).selected_text(copies_text).width(90.0).show_ui(ui, |ui| {
-                for n in [2u32, 3, 4, 5, 10] {
-                    ui.selectable_value(&mut q.min_copies, n, format!("{n}+ copies"));
-                }
-            });
-            let hash_text = match q.hash {
-                HashFilter::Any => "Any hash",
-                HashFilter::Sha256 => "SHA-256 only",
-                HashFilter::Flagged => "Flagged only",
-            };
-            egui::ComboBox::from_id_salt(("g-hash", pane)).selected_text(hash_text).width(110.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut q.hash, HashFilter::Any, "Any hash");
-                ui.selectable_value(&mut q.hash, HashFilter::Sha256, "SHA-256 only");
-                ui.selectable_value(&mut q.hash, HashFilter::Flagged, "Flagged only")
-                    .on_hover_text("Rows whose hash is not SHA-256 (they only match the same algorithm)");
-            });
-        };
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            first(ui, q);
-            if !narrow {
-                second(ui, q);
-            }
-        });
-        if narrow {
+        // the four choices go on as few rows as the tab's width allows (combo boxes do not wrap
+        // by themselves), and none is wider than the tab
+        let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect()).width();
+        let spacing = ui.spacing().item_spacing.x;
+        let widths = [200.0f32, 140.0, 90.0, 110.0].map(|w| w.min(avail - 12.0).max(80.0));
+        for row in toolbar_rows(&widths, avail - 4.0, spacing) {
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
-                second(ui, q);
+                for i in row {
+                    match i {
+                        0 => {
+                            let inv_text = match q.involving.and_then(|id| ix.source_ix(id)) {
+                                Some(s) => format!("With a copy in {}", format::host(&ix.sources()[s as usize].host)),
+                                None => "Any source".into(),
+                            };
+                            egui::ComboBox::from_id_salt(("g-inv", pane))
+                                .selected_text(inv_text)
+                                .width(widths[0])
+                                .height(420.0)
+                                .truncate()
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut q.involving, None, "Any source");
+                                    for s in ix.sources() {
+                                        let text = format!("With a copy in {}", format::host(&s.host));
+                                        ui.selectable_value(&mut q.involving, Some(s.db_id), text);
+                                    }
+                                });
+                        }
+                        1 => {
+                            let spread_text = match q.spread {
+                                Spread::Any => "Anywhere",
+                                Spread::OneSource => "Within one source",
+                                Spread::SeveralSources => "Across sources",
+                            };
+                            egui::ComboBox::from_id_salt(("g-spread", pane))
+                                .selected_text(spread_text)
+                                .width(widths[1])
+                                .truncate()
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut q.spread, Spread::Any, "Anywhere");
+                                    ui.selectable_value(&mut q.spread, Spread::OneSource, "Within one source")
+                                        .on_hover_text("Every copy is on the same machine, drive or cloud account");
+                                    ui.selectable_value(&mut q.spread, Spread::SeveralSources, "Across sources")
+                                        .on_hover_text("Copies on two or more machines, drives or cloud accounts");
+                                });
+                        }
+                        2 => {
+                            let copies_text = format!("{}+ copies", q.min_copies.max(2));
+                            egui::ComboBox::from_id_salt(("g-min", pane))
+                                .selected_text(copies_text)
+                                .width(widths[2])
+                                .show_ui(ui, |ui| {
+                                    for n in [2u32, 3, 4, 5, 10] {
+                                        ui.selectable_value(&mut q.min_copies, n, format!("{n}+ copies"));
+                                    }
+                                });
+                        }
+                        _ => {
+                            let hash_text = match q.hash {
+                                HashFilter::Any => "Any hash",
+                                HashFilter::Sha256 => "SHA-256 only",
+                                HashFilter::Flagged => "Flagged only",
+                            };
+                            egui::ComboBox::from_id_salt(("g-hash", pane))
+                                .selected_text(hash_text)
+                                .width(widths[3])
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut q.hash, HashFilter::Any, "Any hash");
+                                    ui.selectable_value(&mut q.hash, HashFilter::Sha256, "SHA-256 only");
+                                    ui.selectable_value(&mut q.hash, HashFilter::Flagged, "Flagged only")
+                                        .on_hover_text(
+                                            "Rows whose hash is not SHA-256 (they only match the same algorithm)",
+                                        );
+                                });
+                        }
+                    }
+                }
             });
         }
         ui.horizontal(|ui| {
@@ -296,14 +310,36 @@ impl GroupsPane {
 
     fn columns(left: f32, right: f32) -> Cols {
         // Each, Copies, Sources, Extra copies; the last two (elided text, bar) give way first
-        let mut w = [84.0f32, 66.0, 130.0, 180.0];
         const MIN: [f32; 4] = [72.0, 62.0, 74.0, 96.0];
+        const NAME_MIN: f32 = 160.0;
         let width = right - left;
-        let name_min = 160.0f32.max((width * 0.4).min(width - MIN.iter().sum::<f32>()));
-        let avail = (right - left - name_min).max(0.0);
-        let text_first = [w[0], w[1], MIN[2], MIN[3]];
+        let mut shown = [true; 4];
+        for k in [2, 0, 1] {
+            let need: f32 = NAME_MIN + (0..4).filter(|&i| shown[i]).map(|i| MIN[i]).sum::<f32>();
+            if need <= width {
+                break;
+            }
+            shown[k] = false;
+        }
+        let mut w = [84.0f32, 66.0, 130.0, 180.0];
+        let mut min = MIN;
+        for i in 0..4 {
+            if !shown[i] {
+                w[i] = 0.0;
+                min[i] = 0.0;
+            }
+        }
+        let min_sum: f32 = min.iter().sum();
+        // once a column had to go, every spare pixel goes to the names
+        let name_min = if shown.iter().all(|&v| v) {
+            NAME_MIN.max((width * 0.4).min(width - min_sum))
+        } else {
+            NAME_MIN.max(width - min_sum)
+        };
+        let avail = (width - name_min).max(0.0);
+        let text_first = [w[0], w[1], min[2], min[3]];
         if widgets::shrink_columns(&mut w, &text_first, avail) > 0.0
-            && widgets::shrink_columns(&mut w, &MIN, avail) > 0.0
+            && widgets::shrink_columns(&mut w, &min, avail) > 0.0
         {
             widgets::scale_columns(&mut w, avail);
         }
@@ -317,6 +353,7 @@ impl GroupsPane {
             copies: Rangef::new(c0, s0),
             sources: Rangef::new(s0, e0),
             wasted: Rangef::new(e0, right),
+            shown,
         }
     }
 
@@ -422,27 +459,35 @@ impl GroupsPane {
         }
         widgets::text_left(&p, nr, &r.name, font.clone(), colors::INK);
         // size of each copy
-        widgets::text_right(&p, inner(cols.size, rect), &format::bytes(g.size), font.clone(), colors::INK_SECONDARY);
+        if cols.shown[0] {
+            let each = format::bytes(g.size);
+            widgets::text_right(&p, inner(cols.size, rect), &each, font.clone(), colors::INK_SECONDARY);
+        }
         // copies
-        widgets::pill(
-            &p,
-            Pos2::new(cols.copies.max - PAD, rect.center().y),
-            &format::count(g.copies as u64),
-            colors::copies_fill(g.copies),
-            small.clone(),
-        );
+        if cols.shown[1] {
+            widgets::pill(
+                &p,
+                Pos2::new(cols.copies.max - PAD, rect.center().y),
+                &format::count(g.copies as u64),
+                colors::copies_fill(g.copies),
+                small.clone(),
+            );
+        }
         // sources
-        let src_text = if g.sources == 1 {
-            match cx.ix.content_sources(g.content).first() {
-                Some(&(s, _)) => format!("only {}", format::host(&cx.ix.sources()[s as usize].host)),
-                None => "1 source".into(),
-            }
-        } else {
-            format::plural(g.sources as u64, "source", "sources")
-        };
-        let sr = inner(cols.sources, rect);
-        let gal = widgets::elided(&p, &src_text, small.clone(), colors::INK_SECONDARY, sr.width());
-        p.galley(Pos2::new(sr.right() - gal.size().x, sr.center().y - gal.size().y / 2.0), gal, colors::INK_SECONDARY);
+        if cols.shown[2] {
+            let src_text = if g.sources == 1 {
+                match cx.ix.content_sources(g.content).first() {
+                    Some(&(s, _)) => format!("only {}", format::host(&cx.ix.sources()[s as usize].host)),
+                    None => "1 source".into(),
+                }
+            } else {
+                format::plural(g.sources as u64, "source", "sources")
+            };
+            let sr = inner(cols.sources, rect);
+            let gal = widgets::elided(&p, &src_text, small.clone(), colors::INK_SECONDARY, sr.width());
+            let pos = Pos2::new(sr.right() - gal.size().x, sr.center().y - gal.size().y / 2.0);
+            p.galley(pos, gal, colors::INK_SECONDARY);
+        }
         // wasted: bar (share of the biggest group) + number
         let wr = inner(cols.wasted, rect);
         let text_w = 64.0f32.min(wr.width());
@@ -542,6 +587,26 @@ impl GroupsPane {
     }
 }
 
+/// Split toolbar items of the given widths into rows that fit `avail` (each row holds at least
+/// one item).
+fn toolbar_rows(widths: &[f32], avail: f32, spacing: f32) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut x = 0.0;
+    for (i, &w) in widths.iter().enumerate() {
+        match rows.last_mut() {
+            Some(row) if x + spacing + w <= avail => {
+                row.push(i);
+                x += spacing + w;
+            }
+            _ => {
+                rows.push(vec![i]);
+                x = w;
+            }
+        }
+    }
+    rows
+}
+
 fn inner(x: Rangef, row: Rect) -> Rect {
     Rect::from_x_y_ranges(Rangef::new(x.min + PAD, x.max - PAD), row.y_range())
 }
@@ -569,6 +634,9 @@ fn header(ui: &mut Ui, rect: Rect, cols: Cols) {
         ),
     ];
     for (i, (t, x, right, tip)) in titles.into_iter().enumerate() {
+        if (1..4).contains(&i) && !cols.shown[i - 1] {
+            continue;
+        }
         let cell = Rect::from_x_y_ranges(x, rect.y_range());
         let inner = if right {
             Rect::from_x_y_ranges(Rangef::new(x.min + 2.0, x.max - PAD), rect.y_range())
@@ -612,6 +680,15 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_rows_fill_the_width() {
+        let w = [200.0, 140.0, 90.0, 110.0];
+        assert_eq!(toolbar_rows(&w, 600.0, 8.0), vec![vec![0, 1, 2, 3]]);
+        assert_eq!(toolbar_rows(&w, 400.0, 8.0), vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(toolbar_rows(&w, 300.0, 8.0), vec![vec![0], vec![1, 2], vec![3]]);
+        assert_eq!(toolbar_rows(&w, 50.0, 8.0), vec![vec![0], vec![1], vec![2], vec![3]]);
+    }
+
+    #[test]
     fn columns_keep_the_right_edge_and_a_usable_name() {
         let c = GroupsPane::columns(0.0, 1000.0);
         assert_eq!(c.wasted.max, 1000.0);
@@ -620,6 +697,11 @@ mod tests {
         assert!(c.name.span() >= 190.0);
         assert!(c.size.span() >= 72.0 - 0.01 && c.copies.span() >= 62.0 - 0.01);
         assert!((c.name.max - c.size.min).abs() < 0.01);
+        // narrow tabs drop Sources, then Each, then Copies
+        assert_eq!(GroupsPane::columns(0.0, 420.0).shown, [true, true, false, true]);
+        assert_eq!(GroupsPane::columns(0.0, 340.0).shown, [false, true, false, true]);
+        assert_eq!(GroupsPane::columns(0.0, 250.0).shown, [false, false, false, true]);
+        assert!(GroupsPane::columns(0.0, 340.0).name.span() >= 160.0 - 0.01);
         // the number columns keep their room while Sources and Extra copies shrink
         let c = GroupsPane::columns(0.0, 760.0);
         assert!((c.size.span() - 84.0).abs() < 0.01 && (c.copies.span() - 66.0).abs() < 0.01);
