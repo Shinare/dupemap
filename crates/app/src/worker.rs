@@ -5,9 +5,13 @@
 //! * A **job** runs one long operation (open, import, remove, change ignore rules, demo data)
 //!   with progress and cancellation, and ends by building a fresh index.
 
+use crate::selection::Target;
 use dupemap_core::db::{ManifestInfo, Progress as ImportProgress};
 use dupemap_core::ignore::IgnoreSettings;
-use dupemap_core::index::{DirIx, FileRow, Index, ListOptions, Node};
+use dupemap_core::index::{
+    DirIx, DirStats, DupGroup, DupQuery, FileIx, FileRow, Filter, Index, ListOptions, Location, Node, OutsideCopies,
+};
+use dupemap_core::natsort::natural_cmp;
 use dupemap_core::{Db, Error, ImportReport, Severity};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -39,12 +43,92 @@ pub enum Query {
         manifest_id: i64,
         dismissed: bool,
     },
+    /// Everything the inspector shows about a file or folder.
+    Inspect {
+        generation: u64,
+        target: Target,
+    },
+    /// One page of duplicate groups (plus the totals when `totals` is set).
+    Groups {
+        generation: u64,
+        query: DupQuery,
+        page: usize,
+        totals: bool,
+    },
+}
+
+/// Rows per page of duplicate groups.
+pub const GROUP_PAGE: usize = 200;
+
+/// The inspector's data for a file: every copy, grouped by source by the UI.
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub file: FileIx,
+    pub name: String,
+    pub size: u64,
+    /// `sha256` or the flagged algorithm.
+    pub algo: String,
+    /// Lowercase hex for SHA-256, `algo:value` otherwise.
+    pub hash: String,
+    pub flagged: bool,
+    pub copies: u32,
+    pub other_sources: u32,
+    /// Every copy including this one, in source order and natural path order.
+    pub locations: Vec<Location>,
+    /// Per location: the file is on this computer (Windows only). Checked once here, off the UI
+    /// thread, because looking at a path on a sleeping drive or share can take seconds.
+    pub on_this_pc: Vec<bool>,
+}
+
+/// The inspector's data for a folder.
+#[derive(Debug, Clone)]
+pub struct DirInfo {
+    pub dir: DirIx,
+    pub path: String,
+    /// Unfiltered statistics.
+    pub stats: DirStats,
+    pub outside: OutsideCopies,
+}
+
+#[derive(Debug, Clone)]
+pub enum Inspection {
+    File(FileInfo),
+    Dir(DirInfo),
+}
+
+/// A duplicate group with a representative file (the first copy in tree order).
+#[derive(Debug, Clone)]
+pub struct GroupRow {
+    pub group: DupGroup,
+    pub file: FileIx,
+    pub name: String,
 }
 
 pub enum Reply {
-    Files { generation: u64, dir: DirIx, opts: ListOptions, files: Result<Arc<Vec<FileRow>>, String> },
+    Files {
+        generation: u64,
+        dir: DirIx,
+        opts: ListOptions,
+        files: Result<Arc<Vec<FileRow>>, String>,
+    },
     Report(Result<Box<ImportReport>, String>),
-    Manifests { manifests: Vec<ManifestInfo>, alert_hosts: BTreeSet<String> },
+    Manifests {
+        manifests: Vec<ManifestInfo>,
+        alert_hosts: BTreeSet<String>,
+    },
+    Inspect {
+        generation: u64,
+        target: Target,
+        info: Result<Box<Inspection>, String>,
+    },
+    Groups {
+        generation: u64,
+        query: DupQuery,
+        page: usize,
+        total: usize,
+        totals: Option<(usize, u64)>,
+        rows: Result<Arc<Vec<GroupRow>>, String>,
+    },
 }
 
 pub struct Worker {
@@ -64,7 +148,7 @@ impl Worker {
                     let mut batch = vec![first];
                     batch.extend(qrx.try_iter());
                     // the newest index wins; queries for older generations are dropped
-                    for q in batch {
+                    for q in prioritise(batch) {
                         match q {
                             Query::SetIndex { generation, index, db_path } => {
                                 let reuse = matches!(&state, Some((_, _, _, p)) if *p == db_path);
@@ -99,6 +183,35 @@ impl Worker {
                                 ));
                                 repaint();
                             }
+                            Query::Inspect { generation, target } => {
+                                let Some((g, ix, db, _)) = &state else { continue };
+                                if *g != generation {
+                                    continue;
+                                }
+                                let info = inspect(ix, db, target).map(Box::new).map_err(|e| e.to_string());
+                                let _ = rtx.send(Reply::Inspect { generation, target, info });
+                                repaint();
+                            }
+                            Query::Groups { generation, query, page, totals } => {
+                                let Some((g, ix, db, _)) = &state else { continue };
+                                if *g != generation {
+                                    continue;
+                                }
+                                let (total, groups) = ix.dup_groups(&query, page * GROUP_PAGE, GROUP_PAGE);
+                                let totals = totals.then(|| ix.dup_totals(&query));
+                                let rows = groups
+                                    .into_iter()
+                                    .map(|group| {
+                                        let file = ix.content_files(group.content)[0];
+                                        let name = db.file_record(ix.file_db_id(file))?.name;
+                                        Ok(GroupRow { group, file, name })
+                                    })
+                                    .collect::<Result<Vec<_>, Error>>()
+                                    .map(Arc::new)
+                                    .map_err(|e| e.to_string());
+                                let _ = rtx.send(Reply::Groups { generation, query, page, total, totals, rows });
+                                repaint();
+                            }
                             Query::SetAlertDismissed { manifest_id, dismissed } => {
                                 let Some((_, _, db, _)) = &state else { continue };
                                 if db.set_alert_dismissed(manifest_id, dismissed).is_ok() {
@@ -122,6 +235,58 @@ impl Worker {
 
     pub fn poll(&self) -> Vec<Reply> {
         self.rx.try_iter().collect()
+    }
+}
+
+/// Order a batch of queries: index changes first, then what the user is looking at right now
+/// (inspector, groups, reports), then file listings. Only the newest inspector request counts.
+fn prioritise(batch: Vec<Query>) -> Vec<Query> {
+    let last_inspect = batch.iter().rposition(|q| matches!(q, Query::Inspect { .. }));
+    let (mut first, mut second, mut third) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, q) in batch.into_iter().enumerate() {
+        match q {
+            Query::SetIndex { .. } => first.push(q),
+            Query::Inspect { .. } if Some(i) != last_inspect => {}
+            Query::Files { .. } => third.push(q),
+            _ => second.push(q),
+        }
+    }
+    first.extend(second);
+    first.extend(third);
+    first
+}
+
+fn inspect(ix: &Index, db: &Db, target: Target) -> Result<Inspection, Error> {
+    match target {
+        Target::File { file, content } => {
+            let rec = db.file_record(ix.file_db_id(file))?;
+            let mut locations = ix.locations(db, content)?;
+            locations.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| natural_cmp(&a.path, &b.path)));
+            let on_this_pc = locations
+                .iter()
+                .map(|l| {
+                    cfg!(windows) && crate::actions::is_this_computer(&l.host) && std::path::Path::new(&l.path).exists()
+                })
+                .collect();
+            Ok(Inspection::File(FileInfo {
+                file,
+                name: rec.name,
+                size: ix.file_size(file),
+                algo: rec.digest.algo_name().to_string(),
+                hash: rec.digest.display(),
+                flagged: !rec.digest.is_sha256(),
+                copies: ix.copies(content),
+                other_sources: ix.copies_other_sources(file),
+                locations,
+                on_this_pc,
+            }))
+        }
+        Target::Dir(dir) => Ok(Inspection::Dir(DirInfo {
+            dir,
+            path: ix.dir_path(dir),
+            stats: ix.rollup(&Filter::default()).stats[dir as usize],
+            outside: ix.copies_outside(dir),
+        })),
     }
 }
 
@@ -388,6 +553,23 @@ pub fn expand_paths(paths: &[PathBuf], notes: &mut Vec<String>) -> Vec<PathBuf> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queries_are_prioritised() {
+        let files = |g| Query::Files { generation: g, dir: 0, opts: ListOptions::default() };
+        let inspect = |d| Query::Inspect { generation: 1, target: Target::Dir(d) };
+        let batch = vec![files(1), inspect(5), files(1), Query::Report { manifest_id: 3 }, inspect(9), files(1)];
+        let order: Vec<String> = prioritise(batch)
+            .iter()
+            .map(|q| match q {
+                Query::Files { .. } => "files".to_string(),
+                Query::Inspect { target: Target::Dir(d), .. } => format!("inspect {d}"),
+                Query::Report { .. } => "report".to_string(),
+                _ => "other".to_string(),
+            })
+            .collect();
+        assert_eq!(order, ["report", "inspect 9", "files", "files", "files"], "superseded inspector request dropped");
+    }
 
     #[test]
     fn folders_expand_to_their_manifests() {

@@ -26,6 +26,44 @@ pub fn text_right(painter: &Painter, rect: Rect, text: &str, font: FontId, color
     painter.text(Pos2::new(rect.right(), rect.center().y), Align2::RIGHT_CENTER, text, font, color)
 }
 
+/// Shrink column widths toward `min` (each in proportion to its room above its minimum) until
+/// they fit in `avail`. Returns how much they are still too wide.
+pub fn shrink_columns(w: &mut [f32], min: &[f32], avail: f32) -> f32 {
+    let excess = w.iter().sum::<f32>() - avail;
+    if excess <= 0.0 {
+        return 0.0;
+    }
+    let slack: f32 = w.iter().zip(min).map(|(a, m)| (a - m).max(0.0)).sum();
+    if slack <= 0.0 {
+        return excess;
+    }
+    let take = excess.min(slack);
+    for (a, m) in w.iter_mut().zip(min) {
+        *a -= take * (*a - m).max(0.0) / slack;
+    }
+    excess - take
+}
+
+/// Scale every column evenly so that together they fit in `avail`.
+pub fn scale_columns(w: &mut [f32], avail: f32) {
+    let total: f32 = w.iter().sum();
+    if total > avail && total > 0.0 {
+        let k = avail.max(0.0) / total;
+        for a in w.iter_mut() {
+            *a *= k;
+        }
+    }
+}
+
+/// Header text right-aligned in `rect`, cut with "…" when the column is narrower than the text.
+pub fn header_right(painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32) -> Rect {
+    let g = elided(painter, text, font, color, rect.width());
+    let pos = Pos2::new(rect.right() - g.size().x, rect.center().y - g.size().y / 2.0);
+    let r = Rect::from_min_size(pos, g.size());
+    painter.galley(pos, g, color);
+    r
+}
+
 /// A horizontal bar: `share` (0..=1) of the track filled with `color`, on a faint full-width track.
 /// Thin and rounded at the data end, anchored at the left.
 pub fn bar(painter: &Painter, rect: Rect, share: f32, color: Color32) {
@@ -122,4 +160,24 @@ pub fn link(ui: &mut Ui, text: impl Into<String>) -> Response {
     let text = text.into();
     let r = ui.add(egui::Label::new(egui::RichText::new(text).color(colors::LINK)).sense(Sense::click()));
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn columns_shrink_toward_their_minimum_first() {
+        let mut w = [170.0, 78.0, 76.0, 170.0];
+        let min = [90.0, 78.0, 76.0, 90.0];
+        assert_eq!(shrink_columns(&mut w, &min, 1000.0), 0.0);
+        assert_eq!(w, [170.0, 78.0, 76.0, 170.0]);
+        assert_eq!(shrink_columns(&mut w, &min, 418.0), 0.0);
+        assert!((w[0] - 132.0).abs() < 0.01 && (w[3] - 132.0).abs() < 0.01 && w[1] == 78.0 && w[2] == 76.0);
+        let left = shrink_columns(&mut w, &min, 300.0);
+        assert!((left - 34.0).abs() < 0.01, "{left}");
+        assert_eq!(w, [90.0, 78.0, 76.0, 90.0]);
+        scale_columns(&mut w, 300.0);
+        assert!((w.iter().sum::<f32>() - 300.0).abs() < 0.01);
+    }
 }

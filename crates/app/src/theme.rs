@@ -9,6 +9,11 @@ const fn rgb(h: u32) -> Color32 {
 
 const HOVER: Color32 = rgb(0x2c2c29);
 const PRESSED: Color32 = rgb(0x363632);
+/// Filled parts of checkboxes, radio buttons and scroll bars (buttons use `weak_bg_fill`):
+/// mid-grey, so an empty box or circle stands out on panels and popups alike.
+const CONTROL: Color32 = rgb(0x6b6a66);
+const CONTROL_HOVER: Color32 = rgb(0x7a7974);
+const CONTROL_PRESSED: Color32 = rgb(0x858480);
 
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
@@ -38,15 +43,15 @@ pub fn configure(style: &mut Style) {
     w.noninteractive.weak_bg_fill = SURFACE;
     w.noninteractive.bg_stroke = Stroke::new(1.0, GRID);
     w.noninteractive.fg_stroke = Stroke::new(1.0, INK_SECONDARY);
-    w.inactive.bg_fill = SURFACE_RAISED;
+    w.inactive.bg_fill = CONTROL;
     w.inactive.weak_bg_fill = SURFACE_RAISED;
     w.inactive.bg_stroke = Stroke::new(1.0, GRID);
     w.inactive.fg_stroke = Stroke::new(1.0, INK);
-    w.hovered.bg_fill = HOVER;
+    w.hovered.bg_fill = CONTROL_HOVER;
     w.hovered.weak_bg_fill = HOVER;
     w.hovered.bg_stroke = Stroke::new(1.0, BASELINE);
     w.hovered.fg_stroke = Stroke::new(1.0, INK);
-    w.active.bg_fill = PRESSED;
+    w.active.bg_fill = CONTROL_PRESSED;
     w.active.weak_bg_fill = PRESSED;
     w.active.bg_stroke = Stroke::new(1.0, INK_MUTED);
     w.active.fg_stroke = Stroke::new(1.0, INK);
@@ -106,4 +111,22 @@ pub fn dock_style(style: &Style) -> egui_dock::Style {
     d.separator.width = 2.0;
     d.overlay.selection_color = alpha(ACCENT, 0.25);
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkboxes_and_radio_buttons_are_visible() {
+        for bg in [PANEL, SURFACE, SURFACE_RAISED, PAGE] {
+            assert!(contrast(CONTROL, bg) >= 2.8, "empty control on {bg:?}");
+        }
+        assert!(contrast(CONTROL, PANEL) >= 3.0);
+        // the tick and the radio dot are drawn in ink on the control
+        for c in [CONTROL, CONTROL_HOVER, CONTROL_PRESSED] {
+            assert!(contrast(INK, c) >= 3.0, "{c:?}");
+        }
+        assert!(contrast(INK, CONTROL) >= 4.5);
+    }
 }

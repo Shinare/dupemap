@@ -2,7 +2,9 @@
 //! computation done directly on the database rows, for many filters and random datasets.
 
 use dupemap_core::ignore::{pattern_matches_path, IgnoreRule, IgnoreSettings};
-use dupemap_core::index::{CopiesFilter, DirIx, FileIx, Filter, HashFilter, Index, ListOptions, Node};
+use dupemap_core::index::{
+    CopiesFilter, DirIx, DupQuery, FileIx, Filter, HashFilter, Index, ListOptions, Node, Spread,
+};
 use dupemap_core::manifest::HEADER;
 use dupemap_core::paths::join_path;
 use dupemap_core::synth::{generate, Config, Rng};
@@ -263,6 +265,135 @@ fn generated_household_data() {
     }
 }
 
+/// `copies_outside` and duplicate-group queries against the brute force.
+fn check_outside_and_groups(db: &Db) {
+    let ix = Index::build_with(db, &IgnoreSettings::disabled(), &mut |_, _| {}).unwrap();
+    let (b, _) = Brute::load(db, &IgnoreSettings::disabled());
+    let db_of = |s: u16| ix.sources()[s as usize].db_id;
+    for d in 0..ix.dir_count() as DirIx {
+        let did = ix.dir_db_id(d);
+        let mut by: HashMap<i64, (u64, u64)> = HashMap::new();
+        let (mut files, mut bytes, mut alone_f, mut alone_b) = (0u64, 0u64, 0u64, 0u64);
+        for (_, dir, size, key) in &b.files {
+            if !b.ancestors[dir].contains(&did) {
+                continue;
+            }
+            files += 1;
+            bytes += size;
+            let srcs: HashSet<i64> = b.groups[key]
+                .iter()
+                .map(|&j| b.files[j].1)
+                .filter(|jd| !b.ancestors[jd].contains(&did))
+                .map(|jd| b.dir_source[&jd])
+                .collect();
+            if srcs.is_empty() {
+                alone_f += 1;
+                alone_b += size;
+            }
+            for s in srcs {
+                let e = by.entry(s).or_default();
+                e.0 += 1;
+                e.1 += size;
+            }
+        }
+        let got = ix.copies_outside(d);
+        assert_eq!(
+            (got.files, got.bytes, got.alone_files, got.alone_bytes),
+            (files, bytes, alone_f, alone_b),
+            "outside {}",
+            ix.dir_path(d)
+        );
+        let got_by: HashMap<i64, (u64, u64)> = got.by_source.iter().map(|&(s, f, n)| (db_of(s), (f, n))).collect();
+        assert_eq!(got_by, by, "copies outside {} by source", ix.dir_path(d));
+        assert!(got.by_source.windows(2).all(|w| w[0].2 >= w[1].2), "most bytes first");
+
+        // "mostly under": bytes of the folder's files with an outside copy under each folder, then
+        // the same greedy descent from every source root
+        let mut cover: HashMap<i64, u64> = HashMap::new();
+        for (_, dir, size, key) in &b.files {
+            if !b.ancestors[dir].contains(&did) {
+                continue;
+            }
+            let mut under: HashSet<i64> = HashSet::new();
+            for &j in &b.groups[key] {
+                let jd = b.files[j].1;
+                if b.ancestors[&jd].contains(&did) {
+                    continue;
+                }
+                under.extend(b.ancestors[&jd].iter().copied());
+            }
+            for a in under {
+                *cover.entry(a).or_default() += size;
+            }
+        }
+        assert_eq!(got.main_dir.len(), got.by_source.len());
+        for (&(s, _, bytes), &(ms, md, mb)) in got.by_source.iter().zip(&got.main_dir) {
+            assert_eq!(s, ms);
+            let need = (bytes as f64 * dupemap_core::index::MAIN_SHARE).ceil() as u64;
+            let mut cur = ix.sources()[s as usize].root;
+            loop {
+                let best = ix
+                    .dir_children(cur)
+                    .iter()
+                    .copied()
+                    .map(|k| (k, cover.get(&ix.dir_db_id(k)).copied().unwrap_or(0)))
+                    .filter(|&(_, c)| c >= need && c > 0)
+                    .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+                match best {
+                    Some((k, _)) => cur = k,
+                    None => break,
+                }
+            }
+            assert_eq!(md, cur, "main folder of {} in source {s}", ix.dir_path(d));
+            assert_eq!(mb, cover.get(&ix.dir_db_id(cur)).copied().unwrap_or(0));
+            assert!(mb >= need || cur == ix.sources()[s as usize].root, "it holds at least the share");
+        }
+    }
+    // duplicate groups under every combination of query options
+    let mut involving: Vec<Option<i64>> = vec![None];
+    involving.extend(db.sources().unwrap().iter().map(|s| Some(s.id)));
+    for spread in [Spread::Any, Spread::OneSource, Spread::SeveralSources] {
+        for hash in [HashFilter::Any, HashFilter::Sha256, HashFilter::Flagged] {
+            for &inv in &involving {
+                for min_copies in [0, 2, 3] {
+                    let q = DupQuery { involving: inv, hash, min_copies, spread };
+                    let mut want_n = 0usize;
+                    let mut want_wasted = 0u64;
+                    for (key, members) in &b.groups {
+                        let srcs: HashSet<i64> = members.iter().map(|&j| b.dir_source[&b.files[j].1]).collect();
+                        let ok = members.len() >= (min_copies.max(2) as usize)
+                            && match hash {
+                                HashFilter::Any => true,
+                                HashFilter::Sha256 => key.0 == 0,
+                                HashFilter::Flagged => key.0 != 0,
+                            }
+                            && inv.is_none_or(|s| srcs.contains(&s))
+                            && match spread {
+                                Spread::Any => true,
+                                Spread::OneSource => srcs.len() == 1,
+                                Spread::SeveralSources => srcs.len() >= 2,
+                            };
+                        if ok {
+                            want_n += 1;
+                            want_wasted += key.2 * (members.len() as u64 - 1);
+                        }
+                    }
+                    let (total, page) = ix.dup_groups(&q, 0, usize::MAX);
+                    assert_eq!(total, want_n, "{q:?}");
+                    assert_eq!(page.len(), want_n);
+                    assert_eq!(ix.dup_totals(&q), (want_n, want_wasted), "{q:?}");
+                    assert!(page.windows(2).all(|w| w[0].wasted >= w[1].wasted), "most wasted first");
+                    // paging returns the same groups in the same order
+                    let (_, a) = ix.dup_groups(&q, 0, 3);
+                    let (_, c) = ix.dup_groups(&q, 3, 1000);
+                    let joined: Vec<_> = a.iter().chain(c.iter()).map(|g| g.content).collect();
+                    assert_eq!(joined, page.iter().map(|g| g.content).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+}
+
 /// Small random trees with heavy duplication: nested copies, same-folder copies, copies across
 /// sources, flagged hashes and overlapping manifests.
 #[test]
@@ -270,6 +401,7 @@ fn random_adversarial_trees() {
     for seed in 0..25u64 {
         let (mut db, n_manifests) = random_db(seed);
         check(&db);
+        check_outside_and_groups(&db);
         // removing a manifest keeps everything consistent
         if n_manifests > 1 {
             let first = db.manifests().unwrap()[0].id;

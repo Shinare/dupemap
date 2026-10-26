@@ -7,6 +7,7 @@ use crate::widgets;
 use dupemap_core::db::ManifestInfo;
 use dupemap_core::{ImportReport, Severity};
 use egui::{RichText, Ui};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -15,6 +16,9 @@ pub struct ManifestsWindow {
     /// Path typed by hand (the only way to import where no file dialog is available).
     path_input: String,
     confirm_remove: Option<(i64, String)>,
+    /// Whether each manifest file is still where it was imported from. Checked once per opening
+    /// of the window: looking at a path on a sleeping drive or share can take seconds.
+    on_disk: HashMap<String, bool>,
 }
 
 impl ManifestsWindow {
@@ -27,6 +31,7 @@ impl ManifestsWindow {
         actions: &mut Vec<Action>,
     ) {
         if !self.open {
+            self.on_disk.clear();
             return;
         }
         let mut open = true;
@@ -122,6 +127,18 @@ impl ManifestsWindow {
                         ui.horizontal(|ui| {
                             if ui.small_button("Report").clicked() {
                                 actions.push(Action::ShowReport(m.id));
+                            }
+                            if cfg!(windows)
+                                && *self
+                                    .on_disk
+                                    .entry(m.file_path.clone())
+                                    .or_insert_with(|| std::path::Path::new(&m.file_path).exists())
+                                && ui
+                                    .small_button("Open folder")
+                                    .on_hover_text("Show the manifest file in Explorer")
+                                    .clicked()
+                            {
+                                actions.push(Action::Reveal(m.file_path.clone()));
                             }
                             if ui
                                 .add_enabled(!busy, egui::Button::new("Re-import").small())

@@ -4,16 +4,19 @@ use crate::actions::{self, Action};
 use crate::colors;
 use crate::files::FileCache;
 use crate::format;
+use crate::groups::{GroupCache, GroupsCtx, GroupsPane};
 use crate::ignore_ui::IgnoreEditor;
+use crate::inspector::Inspector;
 use crate::manifests_ui::{ManifestsWindow, ReportWindow};
 use crate::pane::{PaneCtx, TreePane};
+use crate::selection::{Linked, Target};
 use crate::theme;
 use crate::tree::Root;
 use crate::widgets;
-use crate::worker::{self, Job, JobOutcome, Query, Repaint, Reply, RunningJob, Worker};
+use crate::worker::{self, Inspection, Job, JobOutcome, Query, Repaint, Reply, RunningJob, Worker};
 use dupemap_core::db::ManifestInfo;
 use dupemap_core::ignore::IgnoreSettings;
-use dupemap_core::index::Index;
+use dupemap_core::index::{DirIx, FileIx, Index};
 use dupemap_core::Severity;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{FontId, RichText, Ui};
@@ -38,6 +41,8 @@ struct Shot {
     path: PathBuf,
     stage: u8,
     prepared: bool,
+    /// The groups stage selects its first group once the list is there.
+    picked: bool,
     idle_frames: u32,
     requested: bool,
 }
@@ -48,9 +53,12 @@ pub struct Tab {
     pub kind: TabKind,
 }
 
+// a handful of tabs: boxing the tree pane would save nothing worth the indirection
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TabKind {
     Tree(TreePane),
+    Groups(GroupsPane),
 }
 
 struct Note {
@@ -60,6 +68,7 @@ struct Note {
 }
 
 pub struct DupeMapApp {
+    ctx: egui::Context,
     db_path: PathBuf,
     repaint: Repaint,
     index: Option<Arc<Index>>,
@@ -82,6 +91,10 @@ pub struct DupeMapApp {
     log_open: bool,
     notes: Vec<Note>,
     shot: Option<Shot>,
+    inspector: Inspector,
+    /// Copies of the inspected file (or where a folder's copies are), highlighted in every tab.
+    linked: Option<Linked>,
+    groups: GroupCache,
 }
 
 const STATUS_SECS: f64 = 12.0;
@@ -105,6 +118,7 @@ impl DupeMapApp {
         }
         let first = Tab { id: 1, kind: TabKind::Tree(TreePane::new(Root::AllSources)) };
         DupeMapApp {
+            ctx: ctx.clone(),
             db_path: opts.db_path,
             repaint,
             index: None,
@@ -128,8 +142,11 @@ impl DupeMapApp {
             shot: opts.screenshot.map(|path| {
                 // captures must not depend on where the mouse pointer happens to be
                 ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 1.0e9);
-                Shot { path, stage: 0, prepared: false, idle_frames: 0, requested: false }
+                Shot { path, stage: 0, prepared: false, picked: false, idle_frames: 0, requested: false }
             }),
+            inspector: Inspector::default(),
+            linked: None,
+            groups: GroupCache::default(),
         }
     }
 
@@ -137,8 +154,8 @@ impl DupeMapApp {
         self.job.is_some() || !self.queue.is_empty()
     }
 
-    fn note(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
-        let at = ctx.input(|i| i.time);
+    fn note(&mut self, text: impl Into<String>, error: bool) {
+        let at = self.ctx.input(|i| i.time);
         self.notes.push(Note { text: text.into(), error, at });
         if self.notes.len() > 300 {
             self.notes.remove(0);
@@ -191,6 +208,7 @@ impl DupeMapApp {
             .find(|(_, t)| Some(t.id) == self.focused)
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
+                TabKind::Groups(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources);
         let (surface, node) = match self.focused.and_then(|id| self.dock.find_tab_from(|t| t.id == id)) {
@@ -210,8 +228,8 @@ impl DupeMapApp {
     // ------------------------------------------------------------------ --screenshot
 
     fn screenshot_step(&mut self, ctx: &egui::Context) {
-        /// Captures in order: the main view, then one window at a time.
-        const SHOTS: [&str; 4] = ["", "ignore", "report", "manifests"];
+        /// Captures in order: the main view, the duplicate groups, then one window at a time.
+        const SHOTS: [&str; 5] = ["", "groups", "ignore", "report", "manifests"];
         ctx.request_repaint();
         let image = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
@@ -219,6 +237,12 @@ impl DupeMapApp {
                 _ => None,
             })
         });
+        let idle = self.index.is_some()
+            && self.job.is_none()
+            && self.queue.is_empty()
+            && !self.files.is_pending()
+            && !self.groups.is_pending()
+            && !self.inspector.is_pending();
         let Some(shot) = &mut self.shot else { return };
         if let Some(img) = image {
             let name = SHOTS[(shot.stage as usize).min(SHOTS.len() - 1)];
@@ -236,12 +260,12 @@ impl DupeMapApp {
             shot.requested = false;
             shot.idle_frames = 0;
             shot.prepared = false;
+            shot.picked = false;
             if shot.stage as usize >= SHOTS.len() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             return;
         }
-        let idle = self.index.is_some() && self.job.is_none() && self.queue.is_empty() && !self.files.is_pending();
         if !idle || shot.requested {
             return;
         }
@@ -255,36 +279,54 @@ impl DupeMapApp {
             self.reports.open = false;
             match stage {
                 0 => self.screenshot_layout(),
-                1 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
-                2 => self.reports.open = true,
+                1 => self.process_simple(vec![Action::OpenGroups]),
+                2 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
+                3 => self.reports.open = true,
                 _ => self.manifests_win.open = true,
             }
-        } else if shot.prepared && shot.idle_frames >= 12 {
+        } else if shot.prepared && shot.stage == 1 && !shot.picked && shot.idle_frames >= 3 {
+            // select the biggest group: the inspector lists its copies, the tree highlights them
+            shot.picked = true;
+            shot.idle_frames = 0;
+            let first = self.groups.first_row().map(|r| (r.file, r.group.content));
+            if let Some((file, content)) = first {
+                self.process_simple(vec![
+                    Action::Inspect(Some(Target::File { file, content })),
+                    Action::ShowInTab(file),
+                ]);
+            }
+        } else if shot.prepared && (shot.stage != 1 || shot.picked) && shot.idle_frames >= 12 {
             shot.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
     }
 
-    /// A representative layout: every source on the left, the biggest folder of the second
-    /// source on the right.
+    /// A representative layout: every source on the left with its biggest folder inspected, the
+    /// biggest folder of the second source on the right.
     fn screenshot_layout(&mut self) {
         let Some(ix) = self.index.clone() else { return };
         let mut by_size: Vec<_> = ix.source_summaries().to_vec();
         by_size.sort_by_key(|s| std::cmp::Reverse(s.bytes));
+        let mut inspect = None;
         if let Some(first) = by_size.first() {
             let root = ix.sources()[first.source as usize].root;
             for (_, tab) in self.dock.iter_all_tabs_mut() {
-                let TabKind::Tree(p) = &mut tab.kind;
-                if p.root == Root::AllSources {
-                    p.reveal_largest(&ix, Some(root));
+                if let TabKind::Tree(p) = &mut tab.kind {
+                    if p.root == Root::AllSources {
+                        inspect = p.reveal_largest(&ix, Some(root));
+                    }
                 }
             }
         }
         if let Some(second) = by_size.get(1) {
             let mut tab = self.make_tab(Root::Source(second.db_id));
-            let TabKind::Tree(p) = &mut tab.kind;
-            p.reveal_largest(&ix, None);
-            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.52, vec![tab]);
+            if let TabKind::Tree(p) = &mut tab.kind {
+                p.reveal_largest(&ix, None);
+            }
+            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.5, vec![tab]);
+        }
+        if let Some(d) = inspect {
+            self.process_simple(vec![Action::Inspect(Some(Target::Dir(d)))]);
         }
     }
 
@@ -293,7 +335,7 @@ impl DupeMapApp {
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(out) = self.job.as_ref().and_then(|j| j.poll()) {
             self.job = None;
-            self.finish_job(ctx, out);
+            self.finish_job(out);
         }
         if self.job.is_none() {
             if let Some(next) = self.queue.pop_front() {
@@ -304,10 +346,24 @@ impl DupeMapApp {
             match r {
                 Reply::Files { generation, dir, opts, files } => self.files.insert(generation, dir, opts, files),
                 Reply::Report(Ok(rep)) => self.reports.show_reports(vec![*rep]),
-                Reply::Report(Err(e)) => self.note(ctx, format!("Could not read the report: {e}"), true),
+                Reply::Report(Err(e)) => self.note(format!("Could not read the report: {e}"), true),
                 Reply::Manifests { manifests, alert_hosts } => {
                     self.manifests = manifests;
                     self.alert_hosts = alert_hosts;
+                }
+                Reply::Inspect { generation, target, info } => {
+                    // a folder's copies are only known now: highlight where they mostly are
+                    if let (Ok(i), Some(ix)) = (&info, &self.index) {
+                        if let Inspection::Dir(d) = i.as_ref() {
+                            if generation == self.generation && self.inspector.target() == Some(target) {
+                                self.linked = Linked::for_dir(ix, &d.outside.main_dir);
+                            }
+                        }
+                    }
+                    self.inspector.on_reply(generation, target, info);
+                }
+                Reply::Groups { generation, query, page, total, totals, rows } => {
+                    self.groups.insert(generation, query, page, total, totals, rows)
                 }
             }
         }
@@ -319,7 +375,7 @@ impl DupeMapApp {
         }
     }
 
-    fn finish_job(&mut self, ctx: &egui::Context, out: JobOutcome) {
+    fn finish_job(&mut self, out: JobOutcome) {
         if let Some(ix) = out.index {
             self.generation += 1;
             self.worker.send(Query::SetIndex {
@@ -328,6 +384,10 @@ impl DupeMapApp {
                 db_path: self.db_path.clone(),
             });
             self.files.reset(self.generation);
+            self.groups.reset(self.generation);
+            // file and folder numbers belong to the old index
+            self.inspector.clear();
+            self.linked = None;
             if let Some(ed) = &mut self.ignore {
                 ed.rebase(ix.ignore_settings());
             }
@@ -339,13 +399,13 @@ impl DupeMapApp {
         self.manifests = out.manifests;
         self.alert_hosts = out.alert_hosts;
         for n in out.notes {
-            self.note(ctx, n, false);
+            self.note(n, false);
         }
         if out.cancelled {
-            self.note(ctx, "Cancelled. Manifests imported before the cancel are kept.", false);
+            self.note("Cancelled. Manifests imported before the cancel are kept.", false);
         }
         if let Some(e) = out.error {
-            self.note(ctx, e, true);
+            self.note(e, true);
         }
         if !out.reports.is_empty() {
             let rows: u64 = out.reports.iter().map(|r| r.rows_imported).sum();
@@ -358,20 +418,25 @@ impl DupeMapApp {
             if alerts > 0 {
                 msg.push_str(&format!(" · {} with alerts", alerts));
             }
-            self.note(ctx, msg, false);
+            self.note(msg, false);
             self.reports.show_reports(out.reports);
         }
     }
 
     // ------------------------------------------------------------------ actions
 
-    fn process(&mut self, ctx: &egui::Context, frame: &eframe::Frame, actions: Vec<Action>) {
+    /// Carry out actions outside a frame (the screenshot sequence).
+    fn process_simple(&mut self, actions: Vec<Action>) {
+        self.process(None, actions);
+    }
+
+    fn process(&mut self, frame: Option<&eframe::Frame>, actions: Vec<Action>) {
         for a in actions {
             match a {
                 Action::CopyText(t) => {
-                    ctx.copy_text(t.clone());
+                    self.ctx.copy_text(t.clone());
                     let shown: String = t.chars().take(80).collect();
-                    self.note(ctx, format!("Copied {shown}{}", if t.chars().count() > 80 { "…" } else { "" }), false);
+                    self.note(format!("Copied {shown}{}", if t.chars().count() > 80 { "…" } else { "" }), false);
                 }
                 Action::AddIgnoreRule(rule) => {
                     let mut s = self.current_ignore();
@@ -392,7 +457,6 @@ impl DupeMapApp {
                     }
                     let scope = rule.host.as_deref().map(format::host).unwrap_or("every source").to_string();
                     self.note(
-                        ctx,
                         format!(
                             "Ignoring {} in {scope}{}. Undo in File → Ignored folders.",
                             rule.pattern,
@@ -410,6 +474,20 @@ impl DupeMapApp {
                 }
                 Action::OpenManifests => self.manifests_win.open = true,
                 Action::Import => self.import_dialog(frame),
+                Action::Inspect(t) => self.inspect(t),
+                Action::ShowInTab(f) => {
+                    if let Some(ix) = self.index.clone() {
+                        self.show_in_tab(&ix, ix.file_dir(f), Some(f));
+                    }
+                }
+                Action::ShowDirInTab(d) => {
+                    if let Some(ix) = self.index.clone() {
+                        self.show_in_tab(&ix, d, None);
+                    }
+                }
+                Action::OpenGroups => self.open_groups(),
+                Action::ToggleInspector => self.inspector.open = !self.inspector.open,
+                Action::OpenInspector => self.inspector.open = true,
                 Action::ImportPaths(p) => self.queue_job(Job::Import(p)),
                 Action::RemoveManifests(ids) => self.queue_job(Job::Remove(ids)),
                 Action::ShowReport(id) => self.worker.send(Query::Report { manifest_id: id }),
@@ -418,26 +496,110 @@ impl DupeMapApp {
                 }
                 Action::NewTab(root) => self.add_tab(root),
                 Action::Focus(id) => self.focused = Some(id),
-                Action::Note(n) => self.note(ctx, n, false),
+                Action::Note(n) => self.note(n, false),
                 Action::Reveal(p) => {
                     if let Err(e) = actions::reveal(&p) {
-                        self.note(ctx, format!("Could not open Explorer: {e}"), true);
+                        self.note(format!("Could not open Explorer: {e}"), true);
                     }
                 }
             }
         }
     }
 
+    /// Inspect a file or folder (or nothing) and highlight its copies in every tab.
+    fn inspect(&mut self, t: Option<Target>) {
+        if t == self.inspector.target() {
+            return;
+        }
+        self.inspector.select(self.generation, t, &self.worker);
+        self.linked = match (t, &self.index) {
+            (Some(Target::File { file, .. }), Some(ix)) => Linked::for_file(ix, file),
+            // a folder's highlight arrives with its details (Reply::Inspect)
+            _ => None,
+        };
+    }
+
+    /// Open the tree at a file or folder in the best tab: one showing that source, else the
+    /// focused tab if it shows every source, else any tab showing every source, else a new tab.
+    fn show_in_tab(&mut self, ix: &Arc<Index>, dir: DirIx, file: Option<FileIx>) {
+        let src_db = ix.sources()[ix.dir_source(dir) as usize].db_id;
+        let (mut exact, mut focused_all, mut any_all) = (None, None, None);
+        for (_, tab) in self.dock.iter_all_tabs() {
+            if let TabKind::Tree(p) = &tab.kind {
+                match p.root {
+                    Root::Source(id) if id == src_db => {
+                        exact.get_or_insert(tab.id);
+                    }
+                    Root::AllSources => {
+                        if Some(tab.id) == self.focused {
+                            focused_all = Some(tab.id);
+                        }
+                        any_all.get_or_insert(tab.id);
+                    }
+                    Root::Source(_) => {}
+                }
+            }
+        }
+        let id = match exact.or(focused_all).or(any_all) {
+            Some(id) => id,
+            None => {
+                let tab = self.make_tab(Root::Source(src_db));
+                let id = tab.id;
+                self.dock.push_to_focused_leaf(tab);
+                id
+            }
+        };
+        let mut note = None;
+        for (_, tab) in self.dock.iter_all_tabs_mut() {
+            if tab.id == id {
+                if let TabKind::Tree(p) = &mut tab.kind {
+                    note = p.reveal(ix, dir, file);
+                }
+            }
+        }
+        self.activate_tab(id);
+        if let Some(n) = note {
+            self.note(n, false);
+        }
+    }
+
+    fn activate_tab(&mut self, id: u64) {
+        if let Some(path) = self.dock.find_tab_from(|t| t.id == id) {
+            let _ = self.dock.set_active_tab(path);
+            self.dock.set_focused_node_and_surface(NodePath { surface: path.surface, node: path.node });
+        }
+        self.focused = Some(id);
+    }
+
+    /// Switch to the duplicate groups tab, opening it beside the tree the first time.
+    fn open_groups(&mut self) {
+        let existing = self.dock.iter_all_tabs().find(|(_, t)| matches!(t.kind, TabKind::Groups(_))).map(|(_, t)| t.id);
+        if let Some(id) = existing {
+            self.activate_tab(id);
+            return;
+        }
+        let tab = Tab { id: self.new_tab_id(), kind: TabKind::Groups(GroupsPane::default()) };
+        let id = tab.id;
+        if self.dock.iter_all_tabs().count() == 1 {
+            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.5, vec![tab]);
+        } else {
+            self.dock.push_to_focused_leaf(tab);
+        }
+        self.activate_tab(id);
+    }
+
     #[allow(unused_variables)]
-    fn import_dialog(&mut self, frame: &eframe::Frame) {
+    fn import_dialog(&mut self, frame: Option<&eframe::Frame>) {
         #[cfg(windows)]
         {
-            let picked = rfd::FileDialog::new()
+            let mut dialog = rfd::FileDialog::new()
                 .set_title("Import hash manifests")
                 .add_filter("Hash manifests (*.tsv)", &["tsv"])
-                .add_filter("All files", &["*"])
-                .set_parent(frame)
-                .pick_files();
+                .add_filter("All files", &["*"]);
+            if let Some(frame) = frame {
+                dialog = dialog.set_parent(frame);
+            }
+            let picked = dialog.pick_files();
             if let Some(files) = picked {
                 if !files.is_empty() {
                     self.queue_job(Job::Import(files));
@@ -486,6 +648,16 @@ impl DupeMapApp {
                 }
                 if ui.button("Split below").clicked() {
                     self.split(false);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Duplicate groups").shortcut_text("Ctrl+G")).clicked() {
+                    actions.push(Action::OpenGroups);
+                    ui.close();
+                }
+                let label = if self.inspector.open { "Hide inspector" } else { "Show inspector" };
+                if ui.add(egui::Button::new(label).shortcut_text("Ctrl+I")).clicked() {
+                    actions.push(Action::ToggleInspector);
                     ui.close();
                 }
                 ui.separator();
@@ -699,13 +871,21 @@ impl DupeMapApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         use egui::{Key, KeyboardShortcut, Modifiers};
-        let (open, tab, quit) = ctx.input_mut(|i| {
+        let (open, tab, quit, groups, inspector) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::T)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Q)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::G)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::I)),
             )
         });
+        if groups {
+            actions.push(Action::OpenGroups);
+        }
+        if inspector {
+            actions.push(Action::ToggleInspector);
+        }
         if open {
             actions.push(Action::Import);
         }
@@ -736,20 +916,37 @@ impl eframe::App for DupeMapApp {
             .frame(egui::Frame::new().fill(colors::PAGE).inner_margin(egui::Margin::symmetric(10, 2)))
             .show(ui, |ui| self.status_bar(ui, &mut actions));
 
+        let has_data = self.index.as_ref().is_some_and(|ix| !ix.sources().is_empty()) || !self.manifests.is_empty();
+        if self.inspector.open && has_data {
+            egui::Panel::right("inspector")
+                .resizable(true)
+                .default_size(400.0)
+                .size_range(280.0..=760.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(colors::PANEL)
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .stroke(egui::Stroke::new(1.0, colors::BASELINE)),
+                )
+                .show(ui, |ui| self.inspector.ui(ui, self.index.as_deref(), &mut actions));
+        }
+
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let ix = self.index.clone();
             match ix {
-                Some(ix) if !ix.sources().is_empty() || !self.manifests.is_empty() => {
+                Some(ix) if has_data => {
                     let mut added: Vec<NodePath> = Vec::new();
                     let style = theme::dock_style(ui.style());
                     let mut viewer = Viewer {
                         ix: &ix,
                         generation: self.generation,
                         files: &mut self.files,
+                        groups: &mut self.groups,
                         worker: &self.worker,
                         actions: &mut actions,
                         focused: self.focused,
                         alert_hosts: &self.alert_hosts,
+                        linked: self.linked.as_ref(),
                         added: &mut added,
                     };
                     DockArea::new(&mut self.dock)
@@ -795,7 +992,7 @@ impl eframe::App for DupeMapApp {
             self.log_window(&ctx);
         }
         self.drop_overlay(&ctx);
-        self.process(&ctx, frame, actions);
+        self.process(Some(frame), actions);
         if self.shot.is_some() {
             self.screenshot_step(&ctx);
         }
@@ -806,10 +1003,12 @@ struct Viewer<'a> {
     ix: &'a Arc<Index>,
     generation: u64,
     files: &'a mut FileCache,
+    groups: &'a mut GroupCache,
     worker: &'a Worker,
     actions: &'a mut Vec<Action>,
     focused: Option<u64>,
     alert_hosts: &'a BTreeSet<String>,
+    linked: Option<&'a Linked>,
     added: &'a mut Vec<NodePath>,
 }
 
@@ -838,6 +1037,7 @@ impl TabViewer for Viewer<'_> {
                     title.into()
                 }
             }
+            TabKind::Groups(g) => g.title().into(),
         }
     }
 
@@ -853,8 +1053,22 @@ impl TabViewer for Viewer<'_> {
                     pane_id: tab.id,
                     focused: self.focused == Some(tab.id),
                     alert_hosts: self.alert_hosts,
+                    linked: self.linked,
                 };
                 p.ui(ui, &mut cx);
+            }
+            TabKind::Groups(g) => {
+                let mut cx = GroupsCtx {
+                    ix: self.ix,
+                    generation: self.generation,
+                    cache: self.groups,
+                    worker: self.worker,
+                    actions: self.actions,
+                    pane_id: tab.id,
+                    focused: self.focused == Some(tab.id),
+                    linked: self.linked,
+                };
+                g.ui(ui, &mut cx);
             }
         }
     }

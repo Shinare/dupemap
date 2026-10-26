@@ -193,13 +193,47 @@ pub struct DupGroup {
     pub flagged: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How the copies of a duplicate group are spread over sources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Spread {
+    #[default]
+    Any,
+    /// Every copy is in one source (duplicates on the same machine, drive or cloud account).
+    OneSource,
+    /// Copies in two or more sources.
+    SeveralSources,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DupQuery {
     /// Only groups with a copy in this source (database id).
     pub involving: Option<i64>,
     pub hash: HashFilter,
     pub min_copies: u32,
+    #[serde(default)]
+    pub spread: Spread,
 }
+
+/// Where the files under a folder have copies outside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutsideCopies {
+    /// Files and bytes under the folder.
+    pub files: u64,
+    pub bytes: u64,
+    /// (source, files, bytes): files under the folder with at least one copy outside it in that
+    /// source. A file counts once per source holding a copy. Most bytes first.
+    pub by_source: Vec<(SourceIx, u64, u64)>,
+    /// Files with no copy anywhere outside the folder.
+    pub alone_files: u64,
+    pub alone_bytes: u64,
+    /// For each source in `by_source`, in the same order: the deepest folder of that source that
+    /// still holds a copy of at least [`MAIN_SHARE`] of those bytes, and the bytes it holds
+    /// ("mostly under E:\Backup\Photos"). Copies spread all over a source give its top folder.
+    pub main_dir: Vec<(SourceIx, DirIx, u64)>,
+}
+
+/// Share of a source's copies a folder must hold to be named as where they mostly are.
+pub const MAIN_SHARE: f64 = 0.9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSummary {
@@ -1228,20 +1262,7 @@ impl Index {
 
     /// Duplicate groups, most wasted space first. Returns (total matching groups, page).
     pub fn dup_groups(&self, q: &DupQuery, offset: usize, limit: usize) -> (usize, Vec<DupGroup>) {
-        let inv = q.involving.map(|id| self.source_ix(id));
-        let pass = |c: u32| -> bool {
-            let algo_ok = match q.hash {
-                HashFilter::Any => true,
-                HashFilter::Sha256 => self.hot[c as usize].algo == ALGO_SHA256 as u16,
-                HashFilter::Flagged => self.hot[c as usize].algo != ALGO_SHA256 as u16,
-            };
-            let inv_ok = match inv {
-                None => true,
-                Some(None) => false,
-                Some(Some(s)) => self.copies_in_source(c, s) > 0,
-            };
-            algo_ok && inv_ok && self.copies(c) >= q.min_copies.max(2)
-        };
+        let pass = self.dup_pass(q);
         let mut total = 0usize;
         let mut page = Vec::new();
         for &c in &self.dup_order {
@@ -1263,6 +1284,130 @@ impl Index {
             total += 1;
         }
         (total, page)
+    }
+
+    /// Number of duplicate groups matching a query, and the bytes in their extra copies.
+    pub fn dup_totals(&self, q: &DupQuery) -> (usize, u64) {
+        let pass = self.dup_pass(q);
+        let mut n = 0usize;
+        let mut wasted = 0u64;
+        for &c in &self.dup_order {
+            if pass(c) {
+                n += 1;
+                wasted += self.content_size[c as usize].saturating_mul(self.copies(c) as u64 - 1);
+            }
+        }
+        (n, wasted)
+    }
+
+    fn dup_pass<'a>(&'a self, q: &'a DupQuery) -> impl Fn(u32) -> bool + 'a {
+        let inv = q.involving.map(|id| self.source_ix(id));
+        move |c: u32| -> bool {
+            let h = &self.hot[c as usize];
+            let algo_ok = match q.hash {
+                HashFilter::Any => true,
+                HashFilter::Sha256 => h.algo == ALGO_SHA256 as u16,
+                HashFilter::Flagged => h.algo != ALGO_SHA256 as u16,
+            };
+            let inv_ok = match inv {
+                None => true,
+                Some(None) => false,
+                Some(Some(s)) => self.copies_in_source(c, s) > 0,
+            };
+            let spread_ok = match q.spread {
+                Spread::Any => true,
+                Spread::OneSource => h.src_len == 1,
+                Spread::SeveralSources => h.src_len >= 2,
+            };
+            algo_ok && inv_ok && spread_ok && h.copies >= q.min_copies.max(2)
+        }
+    }
+
+    /// Which sources hold copies of a folder's files outside the folder (the inspector's
+    /// "where are the copies" view), and where in each source they mostly are. Unfiltered: every
+    /// file under the folder counts.
+    pub fn copies_outside(&self, d: DirIx) -> OutsideCopies {
+        let mut out = OutsideCopies::default();
+        if d as usize >= self.dir_db.len() {
+            return out;
+        }
+        let end = self.dir_end[d as usize];
+        let inside = |x: u32| x >= d && x < end;
+        let mut per = vec![(0u64, 0u64); self.sources.len()];
+        // files of this folder that have a copy outside it, by content (a content's outside
+        // copies are the same for all its files here, so each content is walked once)
+        let mut shared: Vec<ContentIx> = Vec::new();
+        for f in self.subtree_files(d) {
+            let size = self.file_size[f as usize];
+            out.files += 1;
+            out.bytes += size;
+            let c = self.file_content[f as usize];
+            let h = &self.hot[c as usize];
+            // all copies in one source and their common folder inside this one: nothing outside
+            let all_inside = h.lca != NONE && inside(h.lca);
+            if h.copies > 1 && !all_inside {
+                shared.push(c);
+            } else {
+                out.alone_files += 1;
+                out.alone_bytes += size;
+            }
+        }
+        shared.sort_unstable();
+        let mut marked_by = vec![u32::MAX; self.sources.len()];
+        // bytes of this folder's files with at least one outside copy under each folder
+        let mut cover = vec![0u64; self.dir_db.len()];
+        let mut cover_mark = vec![u32::MAX; self.dir_db.len()];
+        for run in shared.chunk_by(|a, b| a == b) {
+            let c = run[0];
+            let n = run.len() as u64;
+            let bytes = self.content_size[c as usize] * n;
+            for &g in self.content_files(c) {
+                let gd = self.file_dir[g as usize];
+                if inside(gd) {
+                    continue;
+                }
+                let s = self.dir_source[gd as usize] as usize;
+                if marked_by[s] != c {
+                    marked_by[s] = c;
+                    per[s].0 += n;
+                    per[s].1 += bytes;
+                }
+                // credit the copy's folder and its ancestors, each once per content: stop at the
+                // first one an earlier copy already credited
+                let mut a = gd;
+                while a != NONE && cover_mark[a as usize] != c {
+                    cover_mark[a as usize] = c;
+                    cover[a as usize] += bytes;
+                    a = self.dir_parent[a as usize];
+                }
+            }
+        }
+        out.by_source =
+            per.into_iter().enumerate().filter(|(_, p)| p.0 > 0).map(|(s, p)| (s as SourceIx, p.0, p.1)).collect();
+        out.by_source.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        out.main_dir = out
+            .by_source
+            .iter()
+            .map(|&(s, _, bytes)| {
+                let need = (bytes as f64 * MAIN_SHARE).ceil() as u64;
+                let mut cur = self.sources[s as usize].root;
+                loop {
+                    // the child holding the most, if it holds enough (ties: tree order)
+                    let best = self
+                        .dir_children(cur)
+                        .iter()
+                        .copied()
+                        .filter(|&k| cover[k as usize] >= need && cover[k as usize] > 0)
+                        .max_by(|&a, &b| cover[a as usize].cmp(&cover[b as usize]).then(b.cmp(&a)));
+                    match best {
+                        Some(k) => cur = k,
+                        None => break,
+                    }
+                }
+                (s, cur, cover[cur as usize])
+            })
+            .collect();
+        out
     }
 
     /// Rough heap usage of the index in bytes.

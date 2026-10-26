@@ -16,7 +16,7 @@ pub enum Root {
     Source(i64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     Dir {
         dir: DirIx,

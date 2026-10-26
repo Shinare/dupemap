@@ -1,7 +1,9 @@
 //! Requests from panes and windows, carried out by the app after the frame is drawn.
 
+use crate::selection::Target;
 use crate::tree::Root;
 use dupemap_core::ignore::{IgnoreRule, IgnoreSettings};
+use dupemap_core::index::{DirIx, FileIx};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,16 @@ pub enum Action {
     Reveal(String),
     /// A message for the status bar.
     Note(String),
+    /// Show this in the inspector and highlight its copies in every tab (`None` clears).
+    Inspect(Option<Target>),
+    /// Open the tree at this file (expanding folders) in the best tab for its source.
+    ShowInTab(FileIx),
+    /// Open the tree at this folder.
+    ShowDirInTab(DirIx),
+    /// Open (or switch to) the duplicate groups tab.
+    OpenGroups,
+    ToggleInspector,
+    OpenInspector,
 }
 
 /// Whether a manifest host names this computer ("PC1" or "PC1 D: (Media)" on PC1).

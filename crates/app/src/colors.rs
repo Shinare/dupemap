@@ -34,6 +34,10 @@ pub const LINK: Color32 = rgb(0x6da7ec);
 pub const ROW_HOVER: Color32 = rgb(0x1f1f1d);
 pub const ROW_SELECTED: Color32 = rgb(0x1e2a3a);
 pub const ROW_STRIPE: Color32 = rgb(0x171716);
+/// Rows holding a copy of the selection (orange = copies), and folders on the way to one. Solid
+/// blends of the duplication orange over the panel, so text contrast stays known.
+pub const ROW_LINKED: Color32 = rgb(0x30190c);
+pub const ROW_LINKED_PATH: Color32 = rgb(0x1f1813);
 
 // status (reserved; always with icon + label). "Serious" (#ec835a) joins when something needs it.
 pub const GOOD: Color32 = rgb(0x0ca30c);
@@ -196,6 +200,11 @@ mod tests {
         for bg in [PAGE, PANEL, SURFACE, SURFACE_ALT, ROW_HOVER, ROW_STRIPE] {
             assert!(contrast(INK, bg) >= 12.0);
             assert!(contrast(INK_SECONDARY, bg) >= 7.0);
+            assert!(contrast(INK_MUTED, bg) >= 4.5);
+            assert!(contrast(LINK, bg) >= 4.5);
+        }
+        for bg in [ROW_LINKED, ROW_LINKED_PATH] {
+            assert!(contrast(INK, bg) >= 12.0);
             assert!(contrast(INK_MUTED, bg) >= 4.5);
             assert!(contrast(LINK, bg) >= 4.5);
         }

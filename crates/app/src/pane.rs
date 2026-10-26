@@ -8,11 +8,14 @@ use crate::actions::Action;
 use crate::colors;
 use crate::files::FileCache;
 use crate::format;
+use crate::selection::{Linked, Target};
 use crate::tree::{self, Root, Row, RowKind};
 use crate::widgets;
 use crate::worker::Worker;
 use dupemap_core::ignore::IgnoreRule;
-use dupemap_core::index::{DirIx, DirStats, FileRow, Index, ListOptions, Rollup, SortKey};
+use dupemap_core::index::{
+    CopiesFilter, DirIx, DirStats, FileIx, FileRow, Filter, HashFilter, Index, ListOptions, Rollup, SortKey,
+};
 use dupemap_core::paths::PathKind;
 use egui::{Align2, CornerRadius, FontId, Key, Pos2, Rangef, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
 use serde::{Deserialize, Serialize};
@@ -22,7 +25,7 @@ use std::sync::Arc;
 
 pub const ROW_H: f32 = 22.0;
 const HEADER_H: f32 = 24.0;
-const INDENT: f32 = 16.0;
+const INDENT: f32 = 14.0;
 const PAD: f32 = 8.0;
 const NAME_MIN: f32 = 140.0;
 /// "Expand everything below" opens at most this many folders.
@@ -49,7 +52,8 @@ impl Default for Widths {
     }
 }
 
-const MIN_W: [f32; 4] = [90.0, 52.0, 56.0, 90.0];
+/// Narrowest Size, Files, Copies and Elsewhere columns: the number still fits, the bar goes.
+const MIN_W: [f32; 4] = [76.0, 52.0, 56.0, 72.0];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TreePane {
@@ -72,6 +76,8 @@ struct View {
     offset: f32,
     viewport_h: f32,
     scroll_to: Option<f32>,
+    /// A row to bring into view once it is listed (after a reveal); frames left to wait for it.
+    pending_reveal: Option<(Sel, u16)>,
 }
 
 /// What a pane needs from the app while drawing.
@@ -84,11 +90,14 @@ pub struct PaneCtx<'a> {
     pub pane_id: u64,
     pub focused: bool,
     pub alert_hosts: &'a BTreeSet<String>,
+    /// Copies of the app-wide selection, highlighted in every tab.
+    pub linked: Option<&'a Linked>,
 }
 
 enum Event {
     Toggle(DirIx),
-    Select(Sel),
+    Select(Sel, Target),
+    Filter(Filter),
     Sort(SortKey),
     Root(Root),
     CollapseAll,
@@ -142,22 +151,28 @@ impl TreePane {
         self.view.version += 1;
     }
 
-    /// Expand the path to the biggest folder that directly holds files, starting at `start` (or
-    /// this pane's root), so a fresh view shows real content.
-    pub fn reveal_largest(&mut self, ix: &Index, start: Option<DirIx>) {
-        let Some(mut d) = start.or_else(|| tree::root_dir(ix, self.root)) else { return };
+    /// Expand the path to the folder with the most duplicated bytes that directly holds files,
+    /// starting at `start` (or this pane's root), so a fresh view shows real content. Returns the
+    /// folder it selected.
+    pub fn reveal_largest(&mut self, ix: &Index, start: Option<DirIx>) -> Option<DirIx> {
+        let mut d = start.or_else(|| tree::root_dir(ix, self.root))?;
+        let mut picked = None;
         for _ in 0..16 {
             self.expanded.insert(ix.dir_db_id(d));
             let (_, kids) = ix.list_dirs(dupemap_core::index::Node::Dir(d), &self.opts);
-            let Some(k) = kids.iter().max_by_key(|k| k.stats.bytes) else { break };
+            // most bytes that also exist elsewhere, then most bytes: shows duplication at work
+            let Some(k) = kids.iter().max_by_key(|k| (k.stats.elsewhere_bytes, k.stats.bytes)) else { break };
             if k.direct_files > 0 {
                 self.expanded.insert(ix.dir_db_id(k.dir));
                 self.selected = Some(Sel::Dir(ix.dir_db_id(k.dir)));
+                self.view.pending_reveal = Some((Sel::Dir(ix.dir_db_id(k.dir)), 600));
+                picked = Some(k.dir);
                 break;
             }
             d = k.dir;
         }
         self.invalidate();
+        picked
     }
 
     /// Show another source (or all sources). A single source opens with its first levels expanded
@@ -219,6 +234,7 @@ impl TreePane {
             }
         }
         self.refresh(&ix, cx.files, cx.worker, cx.generation);
+        self.scroll_to_pending_reveal(&ix, cx.files.is_pending());
         let mut ev = Vec::new();
         self.toolbar(ui, &ix, cx, &mut ev);
         ui.add_space(4.0);
@@ -240,9 +256,63 @@ impl TreePane {
         if cx.focused && ui.memory(|m| m.focused().is_none()) {
             self.keyboard(ui, &ix, cx, &mut ev);
         }
+        for e in &ev {
+            if let Event::Select(_, t) = e {
+                cx.actions.push(Action::Inspect(Some(*t)));
+            }
+        }
         let mut notes = Vec::new();
         self.apply(ev, &ix, &mut notes);
         cx.actions.extend(notes.into_iter().map(Action::Note));
+    }
+
+    /// Open the tree at a file or folder: expand the folders above it (and the folder holding a
+    /// file), select it and scroll it into view once listed. Clears this tab's filter if the
+    /// filter hides it. Returns a note for the status bar when it had to.
+    pub fn reveal(&mut self, ix: &Index, dir: DirIx, file: Option<FileIx>) -> Option<String> {
+        let mut note = None;
+        let hidden = match file {
+            Some(f) => !ix.matches(&self.opts.filter, f),
+            None => ix.rollup(&self.opts.filter).stats[dir as usize].files == 0,
+        };
+        if hidden {
+            self.opts.filter = Filter::default();
+            note = Some("Cleared the tab's filter to show it".to_string());
+        }
+        if let Root::Source(id) = self.root {
+            if ix.source_ix(id) != Some(ix.dir_source(dir)) {
+                self.root = Root::AllSources;
+            }
+        }
+        let chain = ix.dir_ancestors(dir);
+        let open_to = if file.is_some() { chain.len() } else { chain.len() - 1 };
+        for &d in &chain[..open_to] {
+            self.expanded.insert(ix.dir_db_id(d));
+        }
+        let sel = match file {
+            Some(f) => Sel::File(ix.file_db_id(f)),
+            None => Sel::Dir(ix.dir_db_id(dir)),
+        };
+        self.selected = Some(sel);
+        self.view.pending_reveal = Some((sel, 600));
+        self.invalidate();
+        note
+    }
+
+    /// Scroll a just-revealed row to the middle of the view once its listing arrived.
+    fn scroll_to_pending_reveal(&mut self, ix: &Index, files_pending: bool) {
+        let Some((sel, left)) = self.view.pending_reveal else { return };
+        let found = (0..self.view.rows.len()).find(|&i| self.row_sel(ix, i) == Some(sel));
+        match found {
+            Some(i) => {
+                let vh = self.view.viewport_h.max(ROW_H * 10.0);
+                self.view.scroll_to = Some((i as f32 * ROW_H - vh / 2.0 + ROW_H / 2.0).max(0.0));
+                self.view.pending_reveal = None;
+            }
+            // everything is listed and it is not there, or we waited long enough: give up quietly
+            None if !files_pending || left == 0 => self.view.pending_reveal = None,
+            None => self.view.pending_reveal = Some((sel, left - 1)),
+        }
     }
 
     fn missing_source(&mut self, ui: &mut Ui, ix: &Index) {
@@ -291,6 +361,7 @@ impl TreePane {
                         }
                     }
                 });
+            self.filter_button(ui, ix, cx, ev);
             if ui.button("Collapse all").on_hover_text("Collapse every folder in this tab").clicked() {
                 ev.push(Event::CollapseAll);
             }
@@ -315,6 +386,72 @@ impl TreePane {
         });
     }
 
+    /// The filter button: a popup to choose which files this tab shows. Folder totals are then
+    /// computed over the matching files only (copies are always counted over everything).
+    fn filter_button(&mut self, ui: &mut Ui, ix: &Index, cx: &mut PaneCtx, ev: &mut Vec<Event>) {
+        let f = &self.opts.filter;
+        let active = !f.is_all();
+        let label = if active { format!("Filter: {}", filter_summary(ix, f)) } else { "Filter".to_string() };
+        let mut button = egui::Button::new(egui::RichText::new(label).color(colors::INK)).truncate();
+        if active {
+            button = button.fill(colors::SELECTION);
+        }
+        let resp = ui.add(button).on_hover_text("Choose which files this tab shows");
+        let mut new = f.clone();
+        egui::Popup::from_toggle_button_response(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .id(ui.id().with(("filter-popup", cx.pane_id)))
+            .show(|ui| {
+                ui.set_min_width(300.0);
+                ui.label(egui::RichText::new("Show files").strong());
+                for (v, text, tip) in [
+                    (CopiesFilter::Any, "All", "Every file"),
+                    (CopiesFilter::Unique, "Unique", "The only copy anywhere"),
+                    (CopiesFilter::Duplicated, "With copies", "Two or more copies anywhere, in any source"),
+                    (
+                        CopiesFilter::InOtherSources,
+                        "With a copy in another source",
+                        "Another machine, drive or cloud account also has it",
+                    ),
+                    (
+                        CopiesFilter::OnlyThisSource,
+                        "With no copy in another source",
+                        "Only its own machine, drive or cloud account has it (perhaps more than once)",
+                    ),
+                ] {
+                    ui.radio_value(&mut new.copies, v, text).on_hover_text(tip);
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Missing from").strong())
+                    .on_hover_text("Only files that have no copy in the chosen source: what that source lacks");
+                ui.radio_value(&mut new.absent_from, None, "Any source (no condition)");
+                for s in ix.sources() {
+                    ui.radio_value(&mut new.absent_from, Some(s.db_id), format!("Not in {}", format::host(&s.host)));
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Hash").strong());
+                ui.radio_value(&mut new.hash, HashFilter::Any, "Any");
+                ui.radio_value(&mut new.hash, HashFilter::Sha256, "SHA-256 only");
+                ui.radio_value(&mut new.hash, HashFilter::Flagged, "Not SHA-256 (flagged)")
+                    .on_hover_text("Rows whose hash is not SHA-256: they only match rows of the same algorithm");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!new.is_all(), egui::Button::new("Show all files")).clicked() {
+                        new = Filter::default();
+                    }
+                    ui.label(
+                        egui::RichText::new("Folder totals count matching files only").small().color(colors::INK_MUTED),
+                    );
+                });
+            });
+        if active && ui.small_button("✕").on_hover_text("Clear the filter").clicked() {
+            new = Filter::default();
+        }
+        if new != self.opts.filter {
+            ev.push(Event::Filter(new));
+        }
+    }
+
     fn root_stats(&self, ix: &Index) -> DirStats {
         match tree::root_dir(ix, self.root) {
             Some(d) => ix.rollup(&self.opts.filter).stats[d as usize],
@@ -325,15 +462,17 @@ impl TreePane {
     fn columns(&self, left: f32, right: f32) -> Cols {
         let w = &self.widths;
         let mut fixed = [w.size, w.files, w.copies, w.elsewhere];
-        // names keep at least ~38% of a narrow pane (split views); the number columns shrink
-        let name_min = NAME_MIN.max((right - left) * 0.38);
+        // names keep half of a narrow pane (split views) unless the numbers would no longer fit.
+        // The other columns shrink: first the two with bars (a bar gives way before any number
+        // does), then all four to their minimum, then evenly.
+        let width = right - left;
+        let name_min = NAME_MIN.max((width * 0.5).min(width - MIN_W.iter().sum::<f32>()));
         let avail = (right - left - name_min).max(0.0);
-        let total: f32 = fixed.iter().sum();
-        if total > avail && total > 0.0 {
-            let k = avail / total;
-            for f in &mut fixed {
-                *f *= k;
-            }
+        let bars_first = [MIN_W[0], fixed[1], fixed[2], MIN_W[3]];
+        if widgets::shrink_columns(&mut fixed, &bars_first, avail) > 0.0
+            && widgets::shrink_columns(&mut fixed, &MIN_W, avail) > 0.0
+        {
+            widgets::scale_columns(&mut fixed, avail);
         }
         let e0 = right - fixed[3];
         let c0 = e0 - fixed[2];
@@ -352,7 +491,8 @@ impl TreePane {
         let roll = ix.rollup(&self.opts.filter);
         let scroll = &ui.spacing().scroll;
         let bar = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
-        let full = ui.available_rect_before_wrap();
+        // never wider than what is visible (a wide toolbar must not push columns off screen)
+        let full = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         let cols = self.columns(full.left(), full.right() - bar);
 
         // header
@@ -399,9 +539,14 @@ impl TreePane {
                 p.rect_filled(cell, CornerRadius::ZERO, colors::SURFACE_RAISED);
             }
             let ink = if sort.is_some() && sort == Some(self.opts.sort) { colors::INK } else { colors::INK_SECONDARY };
-            let inner = cell.shrink2(Vec2::new(PAD, 0.0));
+            // right-aligned titles may use the column's left padding before they are cut
+            let inner = if right {
+                Rect::from_x_y_ranges(Rangef::new(x.min + 2.0, x.max - PAD), rect.y_range())
+            } else {
+                cell.shrink2(Vec2::new(PAD, 0.0))
+            };
             let text_rect = if right {
-                widgets::text_right(&p, inner, title, font.clone(), ink)
+                widgets::header_right(&p, inner, title, font.clone(), ink)
             } else {
                 widgets::text_left(&p, inner, title, font.clone(), ink)
             };
@@ -497,6 +642,17 @@ impl TreePane {
             },
             RowKind::Loading { .. } => (None, None),
         };
+        // how strongly this row is part of the selection's copies (see `Linked`)
+        let link = match (cx.linked, row.kind, file) {
+            (Some(l), RowKind::Dir { dir, .. }, _) => l.dir_level(dir),
+            (Some(l), RowKind::File { .. }, Some(f)) if l.content == Some(f.content) => 2,
+            _ => 0,
+        };
+        let target = match (row.kind, file) {
+            (RowKind::Dir { dir, .. }, _) => Some(Target::Dir(dir)),
+            (RowKind::File { .. }, Some(f)) => Some(Target::File { file: f.file, content: f.content }),
+            _ => None,
+        };
         let id = ui.id().with(("row", cx.pane_id, i, sel));
         // click-only, not focusable: the arrow keys belong to the tree, not to egui's focus
         let resp = ui.interact(rect, id, Sense::CLICK);
@@ -518,8 +674,18 @@ impl TreePane {
             );
         } else if resp.hovered() {
             p.rect_filled(rect, CornerRadius::ZERO, colors::ROW_HOVER);
+        } else if link == 2 {
+            p.rect_filled(rect, CornerRadius::ZERO, colors::ROW_LINKED);
+        } else if link == 1 {
+            p.rect_filled(rect, CornerRadius::ZERO, colors::ROW_LINKED_PATH);
         } else if i % 2 == 1 {
             p.rect_filled(rect, CornerRadius::ZERO, colors::ROW_STRIPE);
+        }
+        if link > 0 && !selected {
+            // a marker as well as the tint, so the highlight does not rely on colour alone
+            let w = if link == 2 { 4.0 } else { 2.0 };
+            let c = if link == 2 { colors::DUP } else { colors::alpha(colors::DUP, 0.6) };
+            p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(w, rect.height())), CornerRadius::ZERO, c);
         }
         let font = FontId::proportional(13.0);
         let small = FontId::proportional(11.5);
@@ -599,16 +765,16 @@ impl TreePane {
                     let on_expander = resp.interact_pointer_pos().is_some_and(|p| exp_rect.contains(p));
                     if on_expander && expandable {
                         ev.push(Event::Toggle(dir));
-                    } else if let Some(s) = sel {
-                        ev.push(Event::Select(s));
+                    } else if let (Some(s), Some(t)) = (sel, target) {
+                        ev.push(Event::Select(s, t));
                     }
                 }
                 if resp.double_clicked() && expandable {
                     ev.push(Event::Toggle(dir));
                 }
                 if resp.secondary_clicked() {
-                    if let Some(s) = sel {
-                        ev.push(Event::Select(s));
+                    if let (Some(s), Some(t)) = (sel, target) {
+                        ev.push(Event::Select(s, t));
                     }
                 }
                 resp.context_menu(|ui| self.dir_menu(ui, ix, dir, cx, ev));
@@ -648,16 +814,12 @@ impl TreePane {
                     small.clone(),
                 );
                 let er = inner(cols.elsewhere, rect);
-                if unique {
+                if f.copies_other_sources == 0 {
+                    // unique, or its copies are all in this source (the Copies pill tells which)
                     widgets::text_right(&p, er, "–", font.clone(), colors::INK_MUTED);
-                } else if f.copies_other_sources == 0 {
-                    widgets::text_right(&p, er, "this source only", small.clone(), colors::INK_MUTED);
                 } else {
-                    let t = if f.copies_other_sources == 1 {
-                        "1 in another source".to_string()
-                    } else {
-                        format!("{} in other sources", format::count(f.copies_other_sources as u64))
-                    };
+                    // copies in other sources (several can be in the same one)
+                    let t = format::plural(f.copies_other_sources as u64, "copy", "copies");
                     let g = widgets::elided(&p, &t, small.clone(), colors::INK_SECONDARY, er.width());
                     p.galley(
                         Pos2::new(er.right() - g.size().x, er.center().y - g.size().y / 2.0),
@@ -667,8 +829,8 @@ impl TreePane {
                 }
                 let resp = resp.on_hover_ui(|ui| file_tooltip(ui, ix, f));
                 if resp.clicked() || resp.secondary_clicked() {
-                    if let Some(s) = sel {
-                        ev.push(Event::Select(s));
+                    if let (Some(s), Some(t)) = (sel, target) {
+                        ev.push(Event::Select(s, t));
                     }
                 }
                 resp.context_menu(|ui| self.file_menu(ui, ix, dir, f, cx));
@@ -686,6 +848,16 @@ impl TreePane {
     fn dir_menu(&self, ui: &mut Ui, ix: &Index, dir: DirIx, cx: &mut PaneCtx, ev: &mut Vec<Event>) {
         let is_source = ix.dir_parent(dir).is_none();
         let source = &ix.sources()[ix.dir_source(dir) as usize];
+        if ui
+            .button("Where are the copies?")
+            .on_hover_text("Which sources and folders hold copies of these files")
+            .clicked()
+        {
+            cx.actions.push(Action::Inspect(Some(Target::Dir(dir))));
+            cx.actions.push(Action::OpenInspector);
+            ui.close();
+        }
+        ui.separator();
         if is_source {
             if ui.button("Open in new tab").clicked() {
                 cx.actions.push(Action::NewTab(Root::Source(source.db_id)));
@@ -753,6 +925,12 @@ impl TreePane {
     fn file_menu(&self, ui: &mut Ui, ix: &Index, dir: DirIx, f: &FileRow, cx: &mut PaneCtx) {
         let path = ix.path_with_name(dir, &f.name);
         let host = &ix.sources()[ix.dir_source(dir) as usize].host;
+        if ui.button("Show every copy").on_hover_text("List every copy in the inspector").clicked() {
+            cx.actions.push(Action::Inspect(Some(Target::File { file: f.file, content: f.content })));
+            cx.actions.push(Action::OpenInspector);
+            ui.close();
+        }
+        ui.separator();
         if ui.button("Copy path").clicked() {
             cx.actions.push(Action::CopyText(path.clone()));
             ui.close();
@@ -830,8 +1008,8 @@ impl TreePane {
             }
         }
         if let Some(t) = target {
-            if let Some(s) = self.row_sel(ix, t) {
-                ev.push(Event::Select(s));
+            if let (Some(s), Some(tg)) = (self.row_sel(ix, t), self.row_target(t)) {
+                ev.push(Event::Select(s, tg));
             }
             // keep the target row in view
             let top = t as f32 * ROW_H;
@@ -856,6 +1034,16 @@ impl TreePane {
         match self.view.rows.get(i)?.kind {
             RowKind::Dir { dir, .. } => Some(Sel::Dir(ix.dir_db_id(dir))),
             RowKind::File { dir, index } => self.view.files.get(&dir)?.get(index).map(|f| Sel::File(f.db_id)),
+            RowKind::Loading { .. } => None,
+        }
+    }
+
+    fn row_target(&self, i: usize) -> Option<Target> {
+        match self.view.rows.get(i)?.kind {
+            RowKind::Dir { dir, .. } => Some(Target::Dir(dir)),
+            RowKind::File { dir, index } => {
+                self.view.files.get(&dir)?.get(index).map(|f| Target::File { file: f.file, content: f.content })
+            }
             RowKind::Loading { .. } => None,
         }
     }
@@ -889,7 +1077,11 @@ impl TreePane {
                     }
                     self.invalidate();
                 }
-                Event::Select(s) => self.selected = Some(s),
+                Event::Select(s, _) => self.selected = Some(s),
+                Event::Filter(f) => {
+                    self.opts.filter = f;
+                    self.invalidate();
+                }
                 Event::Sort(k) => {
                     if self.opts.sort == k {
                         self.opts.descending = !self.opts.descending;
@@ -1014,6 +1206,31 @@ fn source_icon(p: &egui::Painter, rect: Rect, kind: PathKind) {
     }
 }
 
+/// Short description of an active filter for its button: "unique · not in truenas".
+fn filter_summary(ix: &Index, f: &Filter) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match f.copies {
+        CopiesFilter::Any => {}
+        CopiesFilter::Unique => parts.push("unique".into()),
+        CopiesFilter::Duplicated => parts.push("with copies".into()),
+        CopiesFilter::InOtherSources => parts.push("copy in another source".into()),
+        CopiesFilter::OnlyThisSource => parts.push("no copy in another source".into()),
+    }
+    let host = |id: i64| ix.source_ix(id).map(|s| format::host(&ix.sources()[s as usize].host).to_string());
+    if let Some(id) = f.absent_from {
+        parts.push(format!("not in {}", host(id).unwrap_or_else(|| "a removed source".into())));
+    }
+    if let Some(id) = f.present_in {
+        parts.push(format!("in {}", host(id).unwrap_or_else(|| "a removed source".into())));
+    }
+    match f.hash {
+        HashFilter::Any => {}
+        HashFilter::Sha256 => parts.push("SHA-256".into()),
+        HashFilter::Flagged => parts.push("flagged hashes".into()),
+    }
+    parts.join(" · ")
+}
+
 fn kind_label(kind: PathKind) -> &'static str {
     match kind {
         PathKind::Windows => "Windows",
@@ -1109,10 +1326,22 @@ mod tests {
         // narrow window: fixed columns shrink so the name keeps its minimum
         let c = p.columns(0.0, 400.0);
         assert!(c.name.span() >= NAME_MIN - 0.01);
+        // narrow: the bar columns shrink first, so Files and Copies keep their width longer
+        let c = p.columns(0.0, 760.0);
+        assert!(
+            (c.files.span() - 78.0).abs() < 0.01 && (c.copies.span() - 76.0).abs() < 0.01,
+            "{:?}",
+            (c.files, c.copies)
+        );
+        assert!(c.size.span() < 170.0 && c.size.span() >= MIN_W[0] - 0.01);
         // a half-width split pane keeps a usable name column
         let c = p.columns(0.0, 720.0);
-        assert!(c.name.span() >= 0.38 * 720.0 - 0.01, "{}", c.name.span());
+        assert!(c.name.span() >= 0.5 * 720.0 - 0.01, "{}", c.name.span());
         assert_eq!(c.elsewhere.max, 720.0);
+        // a third of a small screen: about half for the name, and the numbers keep their minimum
+        let c = p.columns(0.0, 500.0);
+        assert!(c.name.span() >= 240.0);
+        assert!(c.files.span() >= MIN_W[1] - 0.01 && c.copies.span() >= MIN_W[2] - 0.01);
         // dragging the name|size boundary left widens Size only
         p.resize(0, -30.0);
         assert_eq!(p.widths.size, 200.0);

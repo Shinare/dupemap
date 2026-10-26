@@ -4,7 +4,8 @@ Custom cross-machine duplicate file comparator based on hashes.
 
 Explore and compare file-hash manifests from several machines, find duplicates, and (later
 phases) export delete scripts. Windows desktop app in Rust. Done so far: the test-data generator,
-the core library with three command-line tools (Phases 0–1) and the app shell (Phase 2).
+the core library with three command-line tools (Phases 0–1), the app shell (Phase 2) and the
+compare features: inspector, linked highlighting, filters and duplicate groups (Phase 3).
 
 ## Layout
 
@@ -47,9 +48,31 @@ target\release\DupeMap.exe
   the share of its bytes that also exist outside it (✔ all = every file has a copy outside).
   Unique files are dimmed. Sort by Name or Size by clicking the header; drag header edges to resize.
 * **Keyboard**: ↑ ↓ PgUp PgDn Home End move, → expands, ← collapses or goes to the parent,
-  Enter toggles, Ctrl+C copies the path.
+  Enter toggles, Ctrl+C copies the path. Ctrl+G opens the duplicate groups, Ctrl+I shows or hides
+  the inspector.
 * **Right-click** a folder or file: copy path or name, show in Explorer (for paths on this PC),
-  expand or collapse everything below, **ignore this folder**.
+  expand or collapse everything below, **ignore this folder**, *Show every copy* / *Where are the
+  copies?* (opens the inspector).
+* **Inspector** (the panel on the right; View → Show/Hide inspector). Select a file and it lists
+  **every copy**, grouped by source, with its path; *Show* opens that copy in a tab (it expands
+  the folders and scrolls to it), next to *Copy path* and *Show in Explorer* for files on this PC.
+  No copy is called the original: which ones to keep is your decision. Select a folder and it
+  shows how much of it has a copy outside it, which sources hold those copies, and in each source
+  the folder holding (nearly) all of them, with *Show* to jump there.
+* **Linked highlighting**: while a file is selected, every copy of it is shaded orange in every
+  tab, and the folders leading to those copies get a fainter shade with a thin orange mark, so
+  collapsed folders show where to look. While a folder is selected, the folders holding its
+  copies are marked the same way.
+* **Filter** (button above each table; every tab has its own): *Unique*, *With copies*, *With a
+  copy in another source*, *With no copy in another source* (only on its own machine or drive),
+  *Missing from* a chosen source (what that source lacks), and *SHA-256 only* / *Not SHA-256
+  (flagged)*. Folder sizes and counts then add up the matching files only. ✕ clears the filter.
+* **Duplicate groups** (View → Duplicate groups): every set of identical files, the most space in
+  extra copies first (extra copies = every copy beyond one). Narrow it to groups with a copy on a
+  chosen source, groups within one source or across sources, 3+ copies, or flagged hashes.
+  Selecting a group lists its copies in the inspector; double-click or Enter opens the first copy
+  in a tab.
+* **Manifests** (File → Manifests): *Open folder* opens the folder holding a manifest file.
 * **Ignored folders** (File → Ignored folders): folders matching a rule are left out completely —
   not shown, not counted, and their files never count as copies. Windows system folders, Program
   Files, ProgramData, `$Recycle.Bin`-style folders, AppData and ZFS `.zfs` snapshot folders are
@@ -106,6 +129,9 @@ manifest of the same file name replaces the earlier import.
 * For every folder, under any filter: total size, file count, files with another copy anywhere,
   and the bytes/files whose content also exists **outside that folder**. "Fully duplicated
   elsewhere" means every file in the folder has a copy outside it.
+* "Where the copies are" (inspector, for a folder): per source, the bytes of the folder's files
+  that have a copy there (outside the folder itself; a file can count for several sources), and
+  the deepest folder of that source holding copies of at least 90% of those bytes.
 
 ## Tests and benchmarks
 
