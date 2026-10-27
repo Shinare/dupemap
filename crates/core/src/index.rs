@@ -945,6 +945,11 @@ impl Index {
         self.file_db[f as usize]
     }
 
+    /// Dense file index for a database file id (a linear scan: for restoring a session).
+    pub fn file_by_db_id(&self, db_id: i64) -> Option<FileIx> {
+        self.file_db.iter().position(|&x| x == db_id).map(|p| p as FileIx)
+    }
+
     pub fn file_dir(&self, f: FileIx) -> DirIx {
         self.file_dir[f as usize]
     }
@@ -1774,6 +1779,19 @@ mod tests {
         assert_eq!((s.bytes, s.files, s.dup_files, s.elsewhere_bytes, s.elsewhere_files), (35, 4, 3, 20, 1));
         let s = stats(&ix, &all, "PC1 D: (Data)");
         assert_eq!((s.bytes, s.files), (70, 4));
+    }
+
+    #[test]
+    fn database_ids_find_folders_and_files_again() {
+        let (_db, ix) = fixture();
+        for d in 0..ix.dir_count() as DirIx {
+            assert_eq!(ix.dir_by_db_id(ix.dir_db_id(d)), Some(d));
+        }
+        for f in 0..ix.file_count() as FileIx {
+            assert_eq!(ix.file_by_db_id(ix.file_db_id(f)), Some(f));
+        }
+        assert_eq!(ix.dir_by_db_id(-5), None);
+        assert_eq!(ix.file_by_db_id(-5), None);
     }
 
     #[test]

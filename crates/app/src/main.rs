@@ -19,6 +19,7 @@ mod inspector;
 mod manifests_ui;
 mod pane;
 mod selection;
+mod session;
 mod shot;
 mod summary_ui;
 mod theme;
@@ -26,6 +27,7 @@ mod tree;
 mod widgets;
 mod worker;
 
+use dupemap_core::sessionfile::SessionFile;
 use std::path::PathBuf;
 
 fn default_db_path() -> PathBuf {
@@ -47,9 +49,10 @@ fn parse_size(v: &str) -> Option<[f32; 2]> {
     (w >= 400.0 && h >= 300.0).then_some([w, h])
 }
 
-fn parse_args() -> Result<(app::Options, [f32; 2]), String> {
-    let mut opts = app::Options { db_path: default_db_path(), demo_rows: None, screenshot: None };
-    let mut size = [1440.0, 900.0];
+fn parse_args() -> Result<(app::Options, Option<[f32; 2]>, bool), String> {
+    let mut opts = app::Options { db_path: default_db_path(), ..Default::default() };
+    let mut size = None;
+    let mut reset_session = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -61,13 +64,14 @@ fn parse_args() -> Result<(app::Options, [f32; 2]), String> {
             "--screenshot" => opts.screenshot = Some(PathBuf::from(args.next().ok_or("--screenshot needs a file")?)),
             "--window" => {
                 let v = args.next().ok_or("--window needs a size like 1024x768")?;
-                size = parse_size(&v).ok_or(format!("bad window size: {v}"))?;
+                size = Some(parse_size(&v).ok_or(format!("bad window size: {v}"))?);
             }
+            "--reset-session" => reset_session = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    Ok((opts, size))
+    Ok((opts, size, reset_session))
 }
 
 /// The window icon: two overlapping documents (blue = size, orange = copies), drawn at startup.
@@ -119,25 +123,46 @@ fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
-    let (opts, size) = match parse_args() {
+    let (mut opts, size, reset_session) = match parse_args() {
         Ok(o) => o,
         Err(e) => {
             if !e.is_empty() {
                 eprintln!("{e}");
             }
-            eprintln!("usage: DupeMap [--db <path>] [--demo <rows>] [--window <width>x<height>]");
+            eprintln!("usage: DupeMap [--db <path>] [--demo <rows>] [--window <width>x<height>] [--reset-session]");
             std::process::exit(if e.is_empty() { 0 } else { 2 });
         }
     };
-    let native = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("DupeMap")
-            .with_app_id("dupemap")
-            .with_inner_size(size)
-            .with_min_inner_size([760.0, 440.0])
-            .with_icon(icon()),
-        ..Default::default()
+    // the saved session (tabs, layout, window) lives beside the database; screenshots neither
+    // read nor write it
+    if opts.screenshot.is_none() {
+        let file = SessionFile::beside(&opts.db_path);
+        if reset_session {
+            file.remove();
+        } else if let (Some(session), _) = session::Session::load(&file) {
+            opts.session = Some(session);
+        }
+        opts.session_file = Some(file);
+    }
+    let saved_window = opts.session.as_ref().and_then(|s| s.window);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("DupeMap")
+        .with_app_id("dupemap")
+        .with_min_inner_size(session::MIN_WINDOW)
+        .with_icon(icon());
+    viewport = match (size, saved_window) {
+        // --window wins over the saved window
+        (Some(size), _) => viewport.with_inner_size(size),
+        (None, Some(w)) => {
+            let v = viewport.with_inner_size(w.size).with_maximized(w.maximized);
+            match w.pos {
+                Some([x, y]) => v.with_position([x, y]),
+                None => v,
+            }
+        }
+        (None, None) => viewport.with_inner_size([1440.0, 900.0]),
     };
+    let native = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("DupeMap", native, Box::new(move |cc| Ok(Box::new(app::DupeMapApp::new(cc, opts)))))
 }
 

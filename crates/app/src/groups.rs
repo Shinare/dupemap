@@ -110,6 +110,15 @@ impl GroupCache {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GroupsPane {
     pub query: DupQuery,
+    /// Selected row and scroll position, kept for the saved session.
+    #[serde(default)]
+    sel: Option<usize>,
+    #[serde(default)]
+    scroll: f32,
+    /// Read from a saved session: put the selection and scroll position back once the list is
+    /// there.
+    #[serde(skip)]
+    restore: bool,
     #[serde(skip)]
     view: View,
 }
@@ -149,11 +158,21 @@ struct Cols {
 
 impl Default for GroupsPane {
     fn default() -> Self {
-        GroupsPane { query: DupQuery { min_copies: 2, ..Default::default() }, view: View::default() }
+        GroupsPane {
+            query: DupQuery { min_copies: 2, ..Default::default() },
+            sel: None,
+            scroll: 0.0,
+            restore: false,
+            view: View::default(),
+        }
     }
 }
 
 impl GroupsPane {
+    pub fn after_load(&mut self) {
+        self.restore = true;
+    }
+
     pub fn title(&self) -> String {
         "Duplicate groups".into()
     }
@@ -161,6 +180,10 @@ impl GroupsPane {
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut GroupsCtx) {
         if self.view.generation != cx.generation {
             self.view = View { generation: cx.generation, ..Default::default() };
+            if std::mem::take(&mut self.restore) {
+                self.view.selected = self.sel;
+                self.view.scroll_to = Some(self.scroll);
+            }
         }
         let full = ui.available_rect_before_wrap();
         if ui.rect_contains_pointer(full) && ui.input(|i| i.pointer.any_pressed()) && !cx.focused {
@@ -412,6 +435,8 @@ impl GroupsPane {
         });
         self.view.offset = out.state.offset.y;
         self.view.viewport_h = out.inner_rect.height();
+        self.sel = self.view.selected;
+        self.scroll = self.view.offset;
     }
 
     #[allow(clippy::too_many_arguments)]

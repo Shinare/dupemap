@@ -98,6 +98,17 @@ target\release\DupeMap.exe
   drive), `**\node_modules` (anywhere), `/mnt/tank/.recycle`, `gdrive:/Trash`. Matching ignores
   case. Changes apply when you press Apply (the index is rebuilt; nothing is re-imported).
 
+* **Your session is kept.** The app saves what you had open, about a second after every change, and
+  restores it at the next start: the tabs and how they are split, per tab the source, sort,
+  filters, expanded folders, selected row and scroll position, the inspector (open or not, its
+  width and what it shows) and the window (size, position, maximised). It is a small file beside
+  the database (`dupemap.session.json`, with a `.bak` copy of the previous one), written to a
+  temporary file and swapped in, so a crash or power cut leaves the last good one. Folders and
+  files are remembered by database id, so re-importing does not lose your place; anything that no
+  longer exists is skipped. View → Reset layout starts again with one tab; `--reset-session`
+  deletes the saved session at startup (for example if a window was left on a monitor you
+  unplugged).
+
 It draws with OpenGL 3, which every GPU driver of the last decade provides. In a virtual machine
 or remote session without GPU drivers, copy `opengl32.dll` and `libgallium_wgl.dll` from a
 [Mesa for Windows](https://github.com/pal1000/mesa-dist-win/releases) build (x64 folder) next to
@@ -106,7 +117,7 @@ or remote session without GPU drivers, copy `opengl32.dll` and `libgallium_wgl.d
 The database lives in `%LOCALAPPDATA%\DupeMap\dupemap.db`; `DupeMap.exe --db D:\other.db` uses
 another one. `DupeMap.exe --db C:\tmp\demo.db --demo 1000000` fills a separate database with
 generated demo data, and `--window 1024x768` opens the window at that size (to try small
-screens). The app reads manifests only; it has no network access and never deletes anything.
+screens; it overrides the saved window size). The app reads manifests only; it has no network access and never deletes anything.
 
 ## Try it on your manifests (command line)
 
