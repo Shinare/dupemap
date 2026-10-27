@@ -1606,33 +1606,44 @@ impl DupeMapApp {
             ),
         ];
         let mut open = self.keys_open;
-        egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            for (i, (title, keys)) in KEYS.iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(8.0);
-                }
-                ui.label(RichText::new(*title).strong().color(colors::INK));
-                egui::Grid::new(("keys", i))
-                    .striped(false)
-                    .num_columns(2)
-                    .spacing([16.0, 3.0])
-                    .min_col_width(170.0)
-                    .show(ui, |ui| {
-                        for (key, what) in keys.iter() {
-                            ui.label(RichText::new(*key).monospace().color(colors::INK));
-                            ui.label(RichText::new(*what).color(colors::INK_SECONDARY));
-                            ui.end_row();
-                        }
-                    });
-            }
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Right-click a folder or file for everything else you can do with it.")
-                    .small()
-                    .color(colors::INK_MUTED),
-            );
-        });
+        // near the top, and on a short screen the list scrolls rather than run off the bottom
+        let screen = ctx.content_rect();
+        let max_height = (screen.height() - 180.0).max(160.0);
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_TOP)
+            .default_pos(egui::pos2(screen.center().x, screen.top() + 56.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| Self::keys_list(ui, &KEYS));
+            });
         self.keys_open = open;
+    }
+
+    fn keys_list(ui: &mut Ui, groups: &[(&str, &[(&str, &str)])]) {
+        for (i, (title, keys)) in groups.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(8.0);
+            }
+            ui.label(RichText::new(*title).strong().color(colors::INK));
+            egui::Grid::new(("keys", i)).striped(false).num_columns(2).spacing([16.0, 3.0]).min_col_width(170.0).show(
+                ui,
+                |ui| {
+                    for (key, what) in keys.iter() {
+                        ui.label(RichText::new(*key).monospace().color(colors::INK));
+                        ui.label(RichText::new(*what).color(colors::INK_SECONDARY));
+                        ui.end_row();
+                    }
+                },
+            );
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Right-click a folder or file for everything else you can do with it.")
+                .small()
+                .color(colors::INK_MUTED),
+        );
     }
 
     fn log_window(&mut self, ctx: &egui::Context) {
