@@ -7,7 +7,7 @@ use crate::format;
 use crate::selection::{Linked, Target};
 use crate::widgets;
 use crate::worker::{GroupRow, Query, Worker, GROUP_PAGE};
-use dupemap_core::index::{DupQuery, HashFilter, Index, Spread};
+use dupemap_core::index::{DupQuery, GroupSort, HashFilter, Index, Spread};
 use egui::{CornerRadius, FontId, Key, Pos2, Rangef, Rect, ScrollArea, Sense, Stroke, Ui, Vec2};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -363,10 +363,23 @@ impl GroupsPane {
         let full = ui.available_rect_before_wrap().intersect(ui.clip_rect());
         let cols = Self::columns(full.left(), full.right() - bar);
         let (hrect, _) = ui.allocate_exact_size(Vec2::new(full.width(), HEADER_H), Sense::hover());
-        header(ui, hrect, cols);
-        // the biggest group sets the bar scale (rows are sorted, so it is the first one)
-        let max_wasted =
-            cx.cache.page(&self.query, 0).and_then(|p| p.first()).map(|r| r.group.wasted).unwrap_or(1).max(1);
+        if let Some((sort, ascending)) = header(ui, hrect, cols, &self.query, cx.pane_id) {
+            self.query.sort = sort;
+            self.query.ascending = ascending;
+            self.view.selected = None;
+            self.view.scroll_to = Some(0.0);
+        }
+        // the bars share one scale whatever the order: the biggest group of this query, which is
+        // the first row of its default order (a cheap page to ask for)
+        let scale_q = DupQuery { sort: GroupSort::Extra, ascending: false, ..self.query.clone() };
+        let max_wasted = match cx.cache.page(&scale_q, 0) {
+            Some(p) => p.first().map(|r| r.group.wasted).unwrap_or(1),
+            None => {
+                cx.cache.request(cx.worker, &scale_q, 0);
+                1
+            }
+        }
+        .max(1);
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut area = ScrollArea::vertical()
             .id_salt(("groups", cx.pane_id))
@@ -611,46 +624,70 @@ fn inner(x: Rangef, row: Rect) -> Rect {
     Rect::from_x_y_ranges(Rangef::new(x.min + PAD, x.max - PAD), row.y_range())
 }
 
-fn header(ui: &mut Ui, rect: Rect, cols: Cols) {
+/// The column titles; clicking a number column sorts by it (again to reverse). Returns the new
+/// order when it changed.
+fn header(ui: &mut Ui, rect: Rect, cols: Cols, q: &DupQuery, pane_id: u64) -> Option<(GroupSort, bool)> {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, CornerRadius::ZERO, colors::SURFACE);
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, colors::BASELINE));
     let font = FontId::proportional(12.5);
-    let titles: [(&str, Rangef, bool, &str); 5] = [
+    let titles: [(&str, Rangef, Option<GroupSort>, &str); 5] = [
         (
             "Name (first copy)",
             cols.name,
-            false,
+            None,
             "Name of the first copy in tree order; other copies may be named differently",
         ),
-        ("Each", cols.size, true, "Size of one copy"),
-        ("Copies", cols.copies, true, "Copies anywhere"),
-        ("Sources", cols.sources, true, "Machines, drives or cloud accounts holding a copy"),
+        ("Each", cols.size, Some(GroupSort::Each), "Size of one copy. Click to sort."),
+        ("Copies", cols.copies, Some(GroupSort::Copies), "Copies anywhere. Click to sort."),
+        (
+            "Sources",
+            cols.sources,
+            Some(GroupSort::Sources),
+            "Machines, drives or cloud accounts holding a copy. Click to sort.",
+        ),
         (
             "Extra copies",
             cols.wasted,
-            true,
-            "Bytes in every copy beyond one: what keeping a single copy would free. Sorted by this.",
+            Some(GroupSort::Extra),
+            "Bytes in every copy beyond one: what keeping a single copy would free. Click to sort.",
         ),
     ];
-    for (i, (t, x, right, tip)) in titles.into_iter().enumerate() {
+    let mut changed = None;
+    for (i, (t, x, key, tip)) in titles.into_iter().enumerate() {
         if (1..4).contains(&i) && !cols.shown[i - 1] {
             continue;
         }
+        let right = key.is_some();
         let cell = Rect::from_x_y_ranges(x, rect.y_range());
+        let resp =
+            ui.interact(cell, ui.id().with(("ghdr", pane_id, i)), if right { Sense::CLICK } else { Sense::hover() });
+        if resp.hovered() && right {
+            p.rect_filled(cell, CornerRadius::ZERO, colors::SURFACE_RAISED);
+        }
         let inner = if right {
             Rect::from_x_y_ranges(Rangef::new(x.min + 2.0, x.max - PAD), rect.y_range())
         } else {
             cell.shrink2(Vec2::new(PAD, 0.0))
         };
-        let ink = if i == 4 { colors::INK } else { colors::INK_SECONDARY };
-        if right {
-            widgets::header_right(&p, inner, t, font.clone(), ink);
+        let active = key == Some(q.sort);
+        let ink = if active { colors::INK } else { colors::INK_SECONDARY };
+        let tr = if right {
+            widgets::header_right(&p, inner, t, font.clone(), ink)
         } else {
-            widgets::text_left(&p, inner, t, font.clone(), ink);
+            widgets::text_left(&p, inner, t, font.clone(), ink)
+        };
+        if active {
+            widgets::sort_arrow(&p, Pos2::new(tr.left() - 8.0, rect.center().y), !q.ascending, ink);
         }
-        ui.interact(cell, ui.id().with(("ghdr", i)), Sense::hover()).on_hover_text(tip);
+        if resp.on_hover_text(tip).clicked() {
+            if let Some(k) = key {
+                // largest first on a new column, reversed on the same one
+                changed = Some(if k == q.sort { (k, !q.ascending) } else { (k, false) });
+            }
+        }
     }
+    changed
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! The application: owns the index, the background threads, the dock of tabs and the windows.
 
 use crate::actions::{self, Action};
+use crate::categories_ui::CategoryEditor;
 use crate::colors;
 use crate::files::FileCache;
 use crate::format;
@@ -10,6 +11,7 @@ use crate::inspector::Inspector;
 use crate::manifests_ui::{ManifestsWindow, ReportWindow};
 use crate::pane::{PaneCtx, TreePane};
 use crate::selection::{Linked, Target};
+use crate::summary_ui::{SummaryCache, SummaryCtx, SummaryPane};
 use crate::theme;
 use crate::tree::Root;
 use crate::widgets;
@@ -17,6 +19,7 @@ use crate::worker::{self, Inspection, Job, JobOutcome, Query, Repaint, Reply, Ru
 use dupemap_core::db::ManifestInfo;
 use dupemap_core::ignore::IgnoreSettings;
 use dupemap_core::index::{DirIx, FileIx, Index};
+use dupemap_core::summary::Categories;
 use dupemap_core::Severity;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{FontId, RichText, Ui};
@@ -59,6 +62,7 @@ pub struct Tab {
 pub enum TabKind {
     Tree(TreePane),
     Groups(GroupsPane),
+    Summary(SummaryPane),
 }
 
 struct Note {
@@ -95,6 +99,12 @@ pub struct DupeMapApp {
     /// Copies of the inspected file (or where a folder's copies are), highlighted in every tab.
     linked: Option<Linked>,
     groups: GroupCache,
+    /// File-type categories as stored in the database.
+    categories: Arc<Categories>,
+    /// Bumped whenever the categories change (summaries computed for older ones are dropped).
+    cats_version: u64,
+    summaries: SummaryCache,
+    category_editor: Option<CategoryEditor>,
 }
 
 const STATUS_SECS: f64 = 12.0;
@@ -147,6 +157,10 @@ impl DupeMapApp {
             inspector: Inspector::default(),
             linked: None,
             groups: GroupCache::default(),
+            categories: Arc::new(Categories::default()),
+            cats_version: 0,
+            summaries: SummaryCache::default(),
+            category_editor: None,
         }
     }
 
@@ -208,6 +222,7 @@ impl DupeMapApp {
             .find(|(_, t)| Some(t.id) == self.focused)
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
+                TabKind::Summary(p) => p.root,
                 TabKind::Groups(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources);
@@ -228,8 +243,9 @@ impl DupeMapApp {
     // ------------------------------------------------------------------ --screenshot
 
     fn screenshot_step(&mut self, ctx: &egui::Context) {
-        /// Captures in order: the main view, the duplicate groups, then one window at a time.
-        const SHOTS: [&str; 5] = ["", "groups", "ignore", "report", "manifests"];
+        /// Captures in order: the main view, the duplicate groups, the summary, then one window at
+        /// a time.
+        const SHOTS: [&str; 6] = ["", "groups", "summary", "ignore", "report", "manifests"];
         ctx.request_repaint();
         let image = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
@@ -242,6 +258,7 @@ impl DupeMapApp {
             && self.queue.is_empty()
             && !self.files.is_pending()
             && !self.groups.is_pending()
+            && !self.summaries.is_pending()
             && !self.inspector.is_pending();
         let Some(shot) = &mut self.shot else { return };
         if let Some(img) = image {
@@ -280,8 +297,13 @@ impl DupeMapApp {
             match stage {
                 0 => self.screenshot_layout(),
                 1 => self.process_simple(vec![Action::OpenGroups]),
-                2 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
-                3 => self.reports.open = true,
+                2 => {
+                    // the summary is a wide table: give it the room the inspector took
+                    self.inspector.open = false;
+                    self.process_simple(vec![Action::OpenSummary(Root::AllSources)]);
+                }
+                3 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
+                4 => self.reports.open = true,
                 _ => self.manifests_win.open = true,
             }
         } else if shot.prepared && shot.stage == 1 && !shot.picked && shot.idle_frames >= 3 {
@@ -295,7 +317,22 @@ impl DupeMapApp {
                     Action::ShowInTab(file),
                 ]);
             }
-        } else if shot.prepared && (shot.stage != 1 || shot.picked) && shot.idle_frames >= 12 {
+        } else if shot.prepared && shot.stage == 2 && !shot.picked && shot.idle_frames >= 3 {
+            // open the biggest category to show its extensions
+            shot.picked = true;
+            shot.idle_frames = 0;
+            let biggest = self
+                .summaries
+                .get(None)
+                .and_then(|s| (0..s.names.len()).max_by_key(|&i| s.categories[i].bytes).map(|i| s.names[i].clone()));
+            if let Some(name) = biggest {
+                for (_, tab) in self.dock.iter_all_tabs_mut() {
+                    if let TabKind::Summary(p) = &mut tab.kind {
+                        p.expand(&name);
+                    }
+                }
+            }
+        } else if shot.prepared && (!matches!(shot.stage, 1 | 2) || shot.picked) && shot.idle_frames >= 12 {
             shot.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
@@ -365,6 +402,14 @@ impl DupeMapApp {
                 Reply::Groups { generation, query, page, total, totals, rows } => {
                     self.groups.insert(generation, query, page, total, totals, rows)
                 }
+                Reply::Summary { generation, scope, version, summary } => {
+                    self.summaries.insert(generation, scope, version, summary)
+                }
+                Reply::Categories(Ok(c)) => {
+                    self.set_categories(c);
+                    self.note("File type categories saved", false);
+                }
+                Reply::Categories(Err(e)) => self.note(format!("Could not save the categories: {e}"), true),
             }
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -385,6 +430,7 @@ impl DupeMapApp {
             });
             self.files.reset(self.generation);
             self.groups.reset(self.generation);
+            self.summaries.reset(self.generation, self.cats_version);
             // file and folder numbers belong to the old index
             self.inspector.clear();
             self.linked = None;
@@ -398,6 +444,11 @@ impl DupeMapApp {
         }
         self.manifests = out.manifests;
         self.alert_hosts = out.alert_hosts;
+        if let Some(c) = out.categories {
+            if *self.categories != c {
+                self.set_categories(c);
+            }
+        }
         for n in out.notes {
             self.note(n, false);
         }
@@ -486,6 +537,13 @@ impl DupeMapApp {
                     }
                 }
                 Action::OpenGroups => self.open_groups(),
+                Action::OpenSummary(root) => self.open_summary(root),
+                Action::OpenCategories => {
+                    if self.category_editor.is_none() {
+                        self.category_editor = Some(CategoryEditor::new(&self.categories));
+                    }
+                }
+                Action::SetCategories(c) => self.worker.send(Query::SetCategories(c)),
                 Action::ToggleInspector => self.inspector.open = !self.inspector.open,
                 Action::OpenInspector => self.inspector.open = true,
                 Action::ImportPaths(p) => self.queue_job(Job::Import(p)),
@@ -571,6 +629,54 @@ impl DupeMapApp {
         self.focused = Some(id);
     }
 
+    /// New categories: summaries are recomputed with them.
+    fn set_categories(&mut self, c: Categories) {
+        self.categories = Arc::new(c);
+        self.cats_version += 1;
+        self.summaries.reset(self.generation, self.cats_version);
+        if let Some(ed) = &mut self.category_editor {
+            ed.rebase(&self.categories);
+        }
+    }
+
+    /// Show a summary: an open summary tab switches to `root`, otherwise a new one opens beside
+    /// the tree.
+    fn open_summary(&mut self, root: Root) {
+        let mut existing = None;
+        for (_, tab) in self.dock.iter_all_tabs_mut() {
+            if let TabKind::Summary(p) = &mut tab.kind {
+                p.root = root;
+                existing = Some(tab.id);
+                break;
+            }
+        }
+        if let Some(id) = existing {
+            self.activate_tab(id);
+            return;
+        }
+        let tab = Tab { id: self.new_tab_id(), kind: TabKind::Summary(SummaryPane::new(root)) };
+        let id = tab.id;
+        if self.dock.iter_all_tabs().count() == 1 {
+            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.5, vec![tab]);
+        } else {
+            self.dock.push_to_focused_leaf(tab);
+        }
+        self.activate_tab(id);
+    }
+
+    /// The root of the focused tab (what "Summary" opens on).
+    fn focused_root(&self) -> Root {
+        self.dock
+            .iter_all_tabs()
+            .find(|(_, t)| Some(t.id) == self.focused)
+            .map(|(_, t)| match &t.kind {
+                TabKind::Tree(p) => p.root,
+                TabKind::Summary(p) => p.root,
+                TabKind::Groups(_) => Root::AllSources,
+            })
+            .unwrap_or(Root::AllSources)
+    }
+
     /// Switch to the duplicate groups tab, opening it beside the tree the first time.
     fn open_groups(&mut self) {
         let existing = self.dock.iter_all_tabs().find(|(_, t)| matches!(t.kind, TabKind::Groups(_))).map(|(_, t)| t.id);
@@ -653,6 +759,14 @@ impl DupeMapApp {
                 ui.separator();
                 if ui.add(egui::Button::new("Duplicate groups").shortcut_text("Ctrl+G")).clicked() {
                     actions.push(Action::OpenGroups);
+                    ui.close();
+                }
+                if ui.add(egui::Button::new("Summary by file type").shortcut_text("Ctrl+U")).clicked() {
+                    actions.push(Action::OpenSummary(self.focused_root()));
+                    ui.close();
+                }
+                if ui.button("File type categories…").clicked() {
+                    actions.push(Action::OpenCategories);
                     ui.close();
                 }
                 let label = if self.inspector.open { "Hide inspector" } else { "Show inspector" };
@@ -871,15 +985,19 @@ impl DupeMapApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         use egui::{Key, KeyboardShortcut, Modifiers};
-        let (open, tab, quit, groups, inspector) = ctx.input_mut(|i| {
+        let (open, tab, quit, groups, inspector, summary) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::T)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Q)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::G)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::I)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::U)),
             )
         });
+        if summary {
+            actions.push(Action::OpenSummary(self.focused_root()));
+        }
         if groups {
             actions.push(Action::OpenGroups);
         }
@@ -944,6 +1062,8 @@ impl eframe::App for DupeMapApp {
                         generation: self.generation,
                         files: &mut self.files,
                         groups: &mut self.groups,
+                        summaries: &mut self.summaries,
+                        categories: &self.categories,
                         worker: &self.worker,
                         actions: &mut actions,
                         focused: self.focused,
@@ -987,6 +1107,15 @@ impl eframe::App for DupeMapApp {
                 self.ignore = None;
             }
         }
+        if let Some(ed) = &mut self.category_editor {
+            // the extensions in no category come from the all-sources summary
+            if self.index.is_some() && self.summaries.get(None).is_none() {
+                self.summaries.request(&self.worker, None, &self.categories);
+            }
+            if !ed.show(&ctx, self.summaries.get(None).map(|s| s.as_ref()), &mut actions) {
+                self.category_editor = None;
+            }
+        }
         if self.about {
             self.about_window(&ctx);
         }
@@ -1006,6 +1135,8 @@ struct Viewer<'a> {
     generation: u64,
     files: &'a mut FileCache,
     groups: &'a mut GroupCache,
+    summaries: &'a mut SummaryCache,
+    categories: &'a Arc<Categories>,
     worker: &'a Worker,
     actions: &'a mut Vec<Action>,
     focused: Option<u64>,
@@ -1040,6 +1171,7 @@ impl TabViewer for Viewer<'_> {
                 }
             }
             TabKind::Groups(g) => g.title().into(),
+            TabKind::Summary(p) => p.title(Some(self.ix)).into(),
         }
     }
 
@@ -1071,6 +1203,18 @@ impl TabViewer for Viewer<'_> {
                     linked: self.linked,
                 };
                 g.ui(ui, &mut cx);
+            }
+            TabKind::Summary(p) => {
+                let mut cx = SummaryCtx {
+                    ix: self.ix,
+                    cache: self.summaries,
+                    categories: self.categories,
+                    worker: self.worker,
+                    actions: self.actions,
+                    pane_id: tab.id,
+                    focused: self.focused == Some(tab.id),
+                };
+                p.ui(ui, &mut cx);
             }
         }
     }

@@ -3,7 +3,7 @@
 
 use dupemap_core::ignore::{pattern_matches_path, IgnoreRule, IgnoreSettings};
 use dupemap_core::index::{
-    CopiesFilter, DirIx, DupQuery, FileIx, Filter, HashFilter, Index, ListOptions, Node, Spread,
+    CopiesFilter, DirIx, DupQuery, FileIx, Filter, GroupSort, HashFilter, Index, ListOptions, Node, Spread,
 };
 use dupemap_core::manifest::HEADER;
 use dupemap_core::paths::join_path;
@@ -356,7 +356,7 @@ fn check_outside_and_groups(db: &Db) {
         for hash in [HashFilter::Any, HashFilter::Sha256, HashFilter::Flagged] {
             for &inv in &involving {
                 for min_copies in [0, 2, 3] {
-                    let q = DupQuery { involving: inv, hash, min_copies, spread };
+                    let q = DupQuery { involving: inv, hash, min_copies, spread, ..Default::default() };
                     let mut want_n = 0usize;
                     let mut want_wasted = 0u64;
                     for (key, members) in &b.groups {
@@ -388,6 +388,33 @@ fn check_outside_and_groups(db: &Db) {
                     let (_, c) = ix.dup_groups(&q, 3, 1000);
                     let joined: Vec<_> = a.iter().chain(c.iter()).map(|g| g.content).collect();
                     assert_eq!(joined, page.iter().map(|g| g.content).collect::<Vec<_>>());
+                    // every other order: the same groups, sorted by the key, ties in the default order
+                    for sort in [GroupSort::Extra, GroupSort::Each, GroupSort::Copies, GroupSort::Sources] {
+                        for ascending in [false, true] {
+                            let qs = DupQuery { sort, ascending, ..q.clone() };
+                            let (n, sorted) = ix.dup_groups(&qs, 0, usize::MAX);
+                            assert_eq!(n, want_n, "{qs:?}");
+                            let key = |g: &dupemap_core::index::DupGroup| match sort {
+                                GroupSort::Extra => g.wasted,
+                                GroupSort::Each => g.size,
+                                GroupSort::Copies => g.copies as u64,
+                                GroupSort::Sources => g.sources as u64,
+                            };
+                            let mut want = page.clone();
+                            if ascending {
+                                want.sort_by_key(key);
+                            } else {
+                                want.sort_by_key(|g| std::cmp::Reverse(key(g)));
+                            }
+                            let got: Vec<_> = sorted.iter().map(|g| g.content).collect();
+                            assert_eq!(got, want.iter().map(|g| g.content).collect::<Vec<_>>(), "{qs:?}");
+                            let (_, p2) = ix.dup_groups(&qs, 2, 2);
+                            assert_eq!(
+                                p2.iter().map(|g| g.content).collect::<Vec<_>>(),
+                                got.iter().skip(2).take(2).copied().collect::<Vec<_>>()
+                            );
+                        }
+                    }
                 }
             }
         }
