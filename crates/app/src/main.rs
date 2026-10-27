@@ -19,6 +19,7 @@ mod groups;
 mod icon_art;
 mod ignore_ui;
 mod inspector;
+mod instance;
 mod manifests_ui;
 mod marks_ui;
 mod pane;
@@ -99,6 +100,33 @@ fn main() -> eframe::Result {
             );
             std::process::exit(if e.is_empty() { 0 } else { 2 });
         }
+    };
+    // one DupeMap per database (screenshots run beside the app)
+    let _lock = if opts.screenshot.is_none() {
+        use instance::Lock;
+        match instance::lock(&opts.db_path, std::time::Duration::ZERO) {
+            Lock::Held(l) => Some(l),
+            Lock::Unavailable => None,
+            // the other one is open: show it (not after a restart as administrator, where the
+            // other one is the old window, closing)
+            Lock::Taken if !opts.open_scan && instance::bring_to_front() => return Ok(()),
+            // closing or starting: wait for it a little
+            Lock::Taken => {
+                let wait = std::time::Duration::from_secs(if opts.open_scan { 20 } else { 3 });
+                match instance::lock(&opts.db_path, wait) {
+                    Lock::Held(l) => Some(l),
+                    Lock::Unavailable => None,
+                    Lock::Taken => {
+                        if opts.open_scan || !instance::bring_to_front() {
+                            instance::say_open(&opts.db_path);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    } else {
+        None
     };
     // the saved session (tabs, layout, window) lives beside the database; screenshots neither
     // read nor write it
