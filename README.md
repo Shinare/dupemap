@@ -79,7 +79,7 @@ target\release\DupeMap.exe
   and `?` (`*.mkv`, `IMG_20??.jpg`) — or files by hash: paste a SHA-256 (or type its first
   digits; `md5:…` for other hashes) to find every copy. Results sort by name, folder, source,
   size or copies; select one to see it in the inspector, double-click to show it in a tab.
-  Under a second for 5 million files.
+  About a second for 5 million files.
 * **Tabs**: every tab shows all sources or one source (the Source box above the table). Add tabs
   with `+` or Ctrl+T, drag a tab to the side of another to split the view, close with ×.
 * **Columns**: *Size* — the bar is the share of the parent folder, its colour the absolute size
