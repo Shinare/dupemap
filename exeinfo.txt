@@ -1,0 +1,1 @@
+description: DupeMap; file version: 0.1.0; product: DupeMap 0.1.0; original name: DupeMap.exe; icons: 1
