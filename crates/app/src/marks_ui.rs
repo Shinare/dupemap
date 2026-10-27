@@ -293,7 +293,7 @@ impl MarksPane {
                     empty_help(ui);
                     return;
                 }
-                totals(ui, cx.ix, st);
+                totals(ui, st);
                 if st.total.last_files > 0 {
                     ui.add_space(8.0);
                     last_copies(ui, cx.ix, st, cx.actions);
@@ -453,7 +453,7 @@ fn empty_help(ui: &mut Ui) {
     );
 }
 
-fn totals(ui: &mut Ui, ix: &Index, st: &MarkState) {
+fn totals(ui: &mut Ui, st: &MarkState) {
     let sources = st.sources.iter().filter(|s| s.files > 0).count();
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Marked:").color(colors::INK_SECONDARY));
@@ -463,12 +463,12 @@ fn totals(ui: &mut Ui, ix: &Index, st: &MarkState) {
                 .color(colors::INK_SECONDARY),
         );
     });
-    let unknown = st.marked_files().filter(|&f| ix.size_state(f) == dupemap_core::index::SizeState::Unknown).count();
+    let unknown = st.unknown_size;
     if unknown > 0 {
         ui.label(
             RichText::new(format!(
                 "{} of them have no known size (from a checksum list) and count as 0 bytes",
-                format::count(unknown as u64)
+                format::count(unknown)
             ))
             .small()
             .color(colors::INK_MUTED),
@@ -501,17 +501,10 @@ fn last_copies(ui: &mut Ui, ix: &Index, st: &MarkState, actions: &mut Vec<Action
                 .color(colors::INK_SECONDARY),
             );
             // where they are, by folder, largest first
-            let mut by_dir: HashMap<DirIx, (u64, u64)> = HashMap::new();
-            for f in st.last_copy_files() {
-                let e = by_dir.entry(ix.file_dir(f)).or_default();
-                e.0 += 1;
-                e.1 += ix.file_size(f);
-            }
-            let mut v: Vec<(DirIx, (u64, u64))> = by_dir.into_iter().collect();
-            v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(b.1 .0.cmp(&a.1 .0)));
+            let v = st.last_copies_by_dir();
             const SHOWN: usize = 30;
             ui.add_space(2.0);
-            for (d, (n, b)) in v.iter().take(SHOWN) {
+            for (d, n, b) in v.iter().take(SHOWN) {
                 let host = &ix.sources()[ix.dir_source(*d) as usize].host;
                 // the numbers and the button stay in view; a long path is cut instead
                 egui::Sides::new().shrink_left().truncate().show(

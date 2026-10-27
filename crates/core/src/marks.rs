@@ -252,6 +252,11 @@ pub struct MarkState {
     pub total: MarkTotals,
     /// Per rule, in the order given.
     pub rules: Vec<RuleEffect>,
+    /// Marked files whose size is not known at all (they count as 0 bytes).
+    pub unknown_size: u64,
+    /// Folders with marked files that would lose their last copy: (folder, files, bytes) of
+    /// those directly in it, largest first.
+    last_by_dir: Vec<(DirIx, u64, u64)>,
     at: HashMap<Place, usize>,
 }
 
@@ -364,6 +369,7 @@ impl MarkState {
         }
         let mut last = vec![0u64; marked.len()];
         let mut dirs = vec![DirMarks::default(); ix.dir_count()];
+        let mut last_by_dir: Vec<(DirIx, u64, u64)> = Vec::new();
         for f in 0..n as FileIx {
             let rule = decided[f as usize];
             if rule != NONE {
@@ -374,10 +380,19 @@ impl MarkState {
             }
             let c = ix.file_content(f);
             let is_last = content_marked[c as usize] >= ix.copies(c);
+            let bytes = ix.file_size(f);
             if is_last {
                 set_bit(&mut last, f);
+                // files are numbered folder by folder: one run per folder
+                let d = ix.file_dir(f);
+                match last_by_dir.last_mut() {
+                    Some(e) if e.0 == d => {
+                        e.1 += 1;
+                        e.2 += bytes;
+                    }
+                    _ => last_by_dir.push((d, 1, bytes)),
+                }
             }
-            let bytes = ix.file_size(f);
             st.total.add(bytes, is_last);
             st.sources[ix.file_source(f) as usize].add(bytes, is_last);
             if rule != NONE {
@@ -398,10 +413,13 @@ impl MarkState {
                 dp.last_files += child.last_files;
             }
         }
+        last_by_dir.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+        st.unknown_size = ix.unknown_size_files().iter().filter(|&&f| bit(&marked, f)).count() as u64;
         st.marked = marked;
         st.last = last;
         st.content_marked = content_marked;
         st.dirs = dirs;
+        st.last_by_dir = last_by_dir;
         st
     }
 
@@ -451,6 +469,12 @@ impl MarkState {
     /// Marked files that would lose their last copy, in index order.
     pub fn last_copy_files(&self) -> impl Iterator<Item = FileIx> + '_ {
         self.marked_files().filter(|&f| self.is_last_copy(f))
+    }
+
+    /// Folders with marked files that would lose their last copy, with the number and bytes of
+    /// those directly in each folder; largest first.
+    pub fn last_copies_by_dir(&self) -> &[(DirIx, u64, u64)] {
+        &self.last_by_dir
     }
 }
 
@@ -595,6 +619,17 @@ mod tests {
         assert!(last.iter().all(|p| !p.ends_with("a.jpg")));
         assert_eq!(st.total.files, 6);
         assert_eq!(st.total.last_bytes, 200 + 200 + 50 + 70);
+        let by_dir: Vec<(String, u64, u64)> =
+            st.last_copies_by_dir().iter().map(|&(d, n, b)| (ix.dir_path(d), n, b)).collect();
+        assert_eq!(
+            by_dir,
+            [
+                (r"D:\Photos".to_string(), 2, 250),
+                (r"D:\Backup\Photos".to_string(), 1, 200),
+                (r"D:\Backup".to_string(), 1, 70)
+            ]
+        );
+        assert_eq!(st.unknown_size, 0);
         // totals per folder add up
         let d = |p: &str| (0..ix.dir_count() as DirIx).find(|&d| ix.dir_path(d) == p).unwrap();
         assert_eq!(st.dir(d(r"D:\Backup")).files, 3);

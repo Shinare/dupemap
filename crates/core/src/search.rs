@@ -6,10 +6,10 @@
 //! other letters are compared through a folding function (lower case, accents removed); names
 //! that are plain ASCII skip it. Results are capped at [`MAX_HITS`].
 
-use crate::db::Db;
+use crate::db::{Db, ALGO_SHA256};
 use crate::error::{err, Result};
-use crate::index::{DirIx, FileIx, Index};
-use crate::manifest::hex32;
+use crate::index::{text_prefix, ContentIx, DirIx, FileIx, Index};
+use crate::manifest::{hex32, Digest};
 use rusqlite::functions::FunctionFlags;
 use serde::{Deserialize, Serialize};
 
@@ -202,12 +202,6 @@ impl HashPattern {
         self.algo.as_deref() != Some("sha256")
     }
 
-    /// The SHA-256 prefix as bytes (whole bytes only; an odd last digit is checked separately).
-    fn sha_prefix(&self) -> Vec<u8> {
-        let even = &self.hex[..self.hex.len() / 2 * 2];
-        (0..even.len() / 2).map(|i| u8::from_str_radix(&even[2 * i..2 * i + 2], 16).unwrap_or(0)).collect()
-    }
-
     fn matches_sha(&self, digest: &[u8]) -> bool {
         if digest.len() != 32 {
             return false;
@@ -267,30 +261,81 @@ pub fn search(
         }
         SearchMode::Hash => {
             let pat = HashPattern::parse(&q.text)?;
+            // The index keeps the first 8 bytes of every hash (of the text, for algorithms
+            // other than SHA-256): the candidates come from memory, and the rest of a longer
+            // hash is checked on a candidate's row.
             if pat.wants_sha256() {
-                let prefix = pat.sha_prefix();
-                let mut st = db.conn().prepare(
-                    "SELECT id, name, digest FROM file
-                     WHERE shadowed_by IS NULL AND algo_id = 0 AND substr(digest, 1, ?1) = ?2",
-                )?;
-                let mut rows = st.query(rusqlite::params![prefix.len() as i64, prefix])?;
-                collect_files(&mut rows, ix, scope, limit, keep_going, &mut out, |r| {
-                    r.get_ref(2).ok().and_then(|v| v.as_blob().ok()).is_some_and(|d| pat.matches_sha(d))
-                })?;
+                let digits = pat.hex.len().min(16);
+                let shift = 64 - 4 * digits as u32;
+                let value = u64::from_str_radix(&pat.hex[..digits], 16).unwrap_or(0).checked_shl(shift).unwrap_or(0);
+                let mask = u64::MAX.checked_shl(shift).unwrap_or(0);
+                let found = ix.contents_with_prefix(value, mask, |a| a == ALGO_SHA256 as u16);
+                let check = |d: &Digest| matches!(d, Digest::Sha256(x) if pat.matches_sha(x));
+                let check: Option<&dyn Fn(&Digest) -> bool> = if pat.hex.len() > 16 { Some(&check) } else { None };
+                add_contents(db, ix, &found, scope, limit, keep_going, &mut out, check)?;
             }
             if pat.wants_other() && !out.truncated {
-                let text = pat.hex.as_bytes().to_vec();
-                let mut st = db.conn().prepare(
-                    "SELECT f.id, f.name FROM file f JOIN algo a ON a.id = f.algo_id
-                     WHERE f.shadowed_by IS NULL AND f.algo_id <> 0 AND substr(f.digest, 1, ?1) = ?2
-                       AND (?3 IS NULL OR a.name = ?3)",
-                )?;
-                let mut rows = st.query(rusqlite::params![text.len() as i64, text, pat.algo])?;
-                collect_files(&mut rows, ix, scope, limit, keep_going, &mut out, |_| true)?;
+                let algo = match &pat.algo {
+                    Some(name) => match ix.algo_id(name) {
+                        Some(id) => Some(id),
+                        // no file has a hash of that kind
+                        None => return Ok(out),
+                    },
+                    None => None,
+                };
+                let text = pat.hex.as_bytes();
+                let n = text.len().min(8);
+                let mask = u64::MAX.checked_shl(64 - 8 * n as u32).unwrap_or(0);
+                let found = ix.contents_with_prefix(text_prefix(&text[..n]), mask, |a| {
+                    a != ALGO_SHA256 as u16 && algo.is_none_or(|x| x == a)
+                });
+                let check = |d: &Digest| matches!(d, Digest::Other { value, .. } if value.as_bytes().starts_with(text));
+                let check: Option<&dyn Fn(&Digest) -> bool> = if text.len() > 8 { Some(&check) } else { None };
+                add_contents(db, ix, &found, scope, limit, keep_going, &mut out, check)?;
             }
         }
     }
     Ok(out)
+}
+
+/// Hits for the files of `contents` (in the scope). `check`, if any, is asked about the hash on
+/// the row of a content's first file: every copy has the same hash, so a `false` rules out them
+/// all.
+#[allow(clippy::too_many_arguments)]
+fn add_contents(
+    db: &Db,
+    ix: &Index,
+    contents: &[ContentIx],
+    scope: Option<crate::index::SourceIx>,
+    limit: usize,
+    keep_going: &dyn Fn() -> bool,
+    out: &mut SearchResult,
+    check: Option<&dyn Fn(&Digest) -> bool>,
+) -> Result<()> {
+    'contents: for &c in contents {
+        if !keep_going() {
+            return Ok(());
+        }
+        let mut checked = check.is_none();
+        for &f in ix.content_files(c) {
+            if scope.is_some_and(|s| ix.file_source(f) != s) {
+                continue;
+            }
+            let rec = db.file_record(ix.file_db_id(f))?;
+            if !checked {
+                if !check.is_some_and(|ok| ok(&rec.digest)) {
+                    continue 'contents;
+                }
+                checked = true;
+            }
+            if out.hits.len() >= limit {
+                out.truncated = true;
+                return Ok(());
+            }
+            out.hits.push(SearchHit { hit: Hit::File(f), name: rec.name });
+        }
+    }
+    Ok(())
 }
 
 fn collect_files(
@@ -525,6 +570,40 @@ mod tests {
         .is_err());
         assert!(looks_like_sha256(&format!(" {A} ")));
         assert!(!looks_like_sha256("abc"));
+    }
+
+    /// Two hashes with the same first 8 bytes: a longer search tells them apart.
+    #[test]
+    fn hashes_sharing_their_first_bytes() {
+        let mut db = Db::open_in_memory().unwrap();
+        let x = format!("{}{}", "1234567890abcdef", "1".repeat(48));
+        let y = format!("{}{}", "1234567890abcdef", "2".repeat(48));
+        let pc = format!(
+            "{HEADER}\n{x}\t10\tPC D: (Data)\tD:\\x.bin\n{y}\t10\tPC D: (Data)\tD:\\y.bin\n{x}\t10\tnas\t/mnt/x.bin\n\
+             md5:abcdef0123456789abcdef0123456789\t5\tPC D: (Data)\tD:\\m1.bin\n\
+             md5:abcdef0199999999abcdef0123456789\t5\tPC D: (Data)\tD:\\m2.bin\n"
+        );
+        db.import_reader("pc.tsv", "pc.tsv", 0, None, pc.as_bytes(), &mut |_| true).unwrap();
+        let ix = Index::build(&db).unwrap();
+        let h = |t: &str| names(&db, &ix, SearchQuery { text: t.into(), mode: SearchMode::Hash, ..Default::default() });
+        assert_eq!(h("1234567890abcdef").len(), 3, "both hashes start like this");
+        assert_eq!(h(&x), ["/mnt/x.bin", r"D:\x.bin"]);
+        assert_eq!(h(&y), [r"D:\y.bin"]);
+        assert_eq!(h("1234567890abcdef2"), [r"D:\y.bin"], "17 digits");
+        assert!(h("1234567890abcdef3").is_empty());
+        let one_source = SearchQuery {
+            text: x.clone(),
+            mode: SearchMode::Hash,
+            scope: ix.sources().iter().find(|s| s.host == "nas").map(|s| s.db_id),
+            ..Default::default()
+        };
+        assert_eq!(names(&db, &ix, one_source), ["/mnt/x.bin"]);
+        // other hashes: their first 8 characters are in memory, the rest is checked
+        assert_eq!(h("abcdef01").len(), 2);
+        assert_eq!(h("abcdef0123"), [r"D:\m1.bin"]);
+        assert_eq!(h("md5:ABCDEF0199"), [r"D:\m2.bin"]);
+        assert!(h("abcdef0100").is_empty());
+        assert!(h("sha1:abcdef01").is_empty(), "no file has a SHA-1");
     }
 
     #[test]
