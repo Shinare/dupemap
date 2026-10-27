@@ -7,6 +7,7 @@
 //! * [`scripts`] makes the same scan as a script for other computers (Windows or Linux).
 //! * [`search`] finds files and folders by name, or files by hash.
 //! * [`sessionfile`] is the crash-safe file the app autosaves its session to.
+//! * [`marks`] works out what marks for deletion mark, and what would lose its last copy.
 //! * [`summary`] totals by file type (editable categories of extensions) and by source.
 //! * [`synth`] generates realistic synthetic manifests for tests and benchmarks.
 
@@ -15,6 +16,7 @@ pub mod error;
 pub mod ignore;
 pub mod index;
 pub mod manifest;
+pub mod marks;
 pub mod natsort;
 pub mod paths;
 pub mod report;

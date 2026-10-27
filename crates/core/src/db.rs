@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// 3: `file.size` is -1 for a file whose size is not known (rows from a checksum list).
-pub const SCHEMA_VERSION: i64 = 3;
+/// 4: `mark` holds the marks for deletion.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Algorithm id reserved for SHA-256.
 pub const ALGO_SHA256: i64 = 0;
@@ -91,6 +92,13 @@ CREATE INDEX IF NOT EXISTS file_shadowed ON file(shadowed_by) WHERE shadowed_by 
 CREATE TABLE IF NOT EXISTS setting (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mark (
+    id      INTEGER PRIMARY KEY,
+    host    TEXT NOT NULL,
+    path    TEXT NOT NULL,
+    is_dir  INTEGER NOT NULL,
+    action  INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO algo(id, name) VALUES (0, 'sha256');
 INSERT OR IGNORE INTO ext(id, name) VALUES (0, '');
@@ -539,6 +547,47 @@ impl Db {
     /// Store edited categories (cleaned up first).
     pub fn set_categories(&self, c: &crate::summary::Categories) -> Result<()> {
         self.set_setting("categories", &c.normalized())
+    }
+
+    /// The marks for deletion, in the order they were made.
+    pub fn marks(&self) -> Result<Vec<crate::marks::MarkRule>> {
+        let mut st = self.conn.prepare("SELECT host, path, is_dir, action FROM mark ORDER BY id")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(host, path, is_dir, action)| {
+                Some(crate::marks::MarkRule {
+                    host,
+                    path,
+                    is_dir: is_dir != 0,
+                    action: crate::marks::MarkAction::from_code(action)?,
+                })
+            })
+            .collect())
+    }
+
+    /// Replace the marks for deletion.
+    pub fn set_marks(&self, rules: &[crate::marks::MarkRule]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM mark", [])?;
+        {
+            let mut st = tx.prepare("INSERT INTO mark(host, path, is_dir, action) VALUES (?1, ?2, ?3, ?4)")?;
+            for r in rules {
+                st.execute(params![r.host, r.path, r.is_dir as i64, r.action.code()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Name and raw bytes (when not UTF-8) of a folder, and its parent folder.
+    pub fn dir_name_raw(&self, dir_id: i64) -> Result<(Option<i64>, String, Option<Vec<u8>>)> {
+        let mut st = self.conn.prepare_cached("SELECT parent_id, name, raw FROM dir WHERE id = ?1")?;
+        Ok(st.query_row([dir_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
     }
 
     pub fn set_alert_dismissed(&self, mid: i64, dismissed: bool) -> Result<()> {
