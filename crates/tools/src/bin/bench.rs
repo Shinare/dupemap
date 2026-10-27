@@ -143,7 +143,7 @@ fn main() {
     }
     let work = work.unwrap_or_else(|| std::env::temp_dir().join(format!("dupemap-bench-{}", cfg.rows)));
     if search_only {
-        let db = Db::open(&work.join("bench.dupemap")).unwrap();
+        let db = Db::open_reader(&work.join("bench.dupemap")).unwrap();
         let s = Instant::now();
         let ix = Index::build(&db).unwrap();
         let mut t = Table(Vec::new());
@@ -190,10 +190,11 @@ fn main() {
     t.add("database size", format!("{:.0} MB", dir_size(&work) as f64 / 1e6));
 
     // what the app does at start-up: open the database, build the index, list the first screen
+    // (with the small page cache the app uses for that)
     drop(db);
     reset_peak();
     let s = Instant::now();
-    let db = Db::open(&db_path).unwrap();
+    let db = Db::open_reader(&db_path).unwrap();
     let mut stages: Vec<(String, Instant)> = Vec::new();
     let ix = Index::build_with_progress(&db, &mut |stage, _| {
         if stages.last().map(|(n, _)| n.as_str()) != Some(stage) {

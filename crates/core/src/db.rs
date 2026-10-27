@@ -27,6 +27,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// 4: `mark` holds the marks for deletion.
 pub const SCHEMA_VERSION: i64 = 4;
 
+/// Page cache of a connection that only reads (KiB).
+pub const READER_CACHE_KIB: i64 = 16 * 1024;
 /// Algorithm id reserved for SHA-256.
 pub const ALGO_SHA256: i64 = 0;
 
@@ -198,6 +200,21 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(60))?;
         Self::init(&conn, true)?;
         Ok(Db { conn, path: Some(path.to_path_buf()) })
+    }
+
+    /// A connection that only reads (listings, searches): a small page cache. The operating
+    /// system caches the file anyway; a large cache per connection only adds to the memory a
+    /// full scan (a search, building the index) leaves behind.
+    pub fn open_reader(path: &Path) -> Result<Db> {
+        let db = Db::open(path)?;
+        db.set_cache_kib(READER_CACHE_KIB)?;
+        Ok(db)
+    }
+
+    /// The page cache of this connection, in KiB.
+    pub fn set_cache_kib(&self, kib: i64) -> Result<()> {
+        self.conn.pragma_update(None, "cache_size", -kib)?;
+        Ok(())
     }
 
     /// A throw-away in-memory database (tests, benchmarks).

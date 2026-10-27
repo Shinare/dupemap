@@ -17,5 +17,9 @@ egui_dock = { version = "0.21", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[build-dependencies]
+# the icon in DupeMap.exe (build.rs)
+miniz_oxide = "0.8"
+
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17", default-features = false }

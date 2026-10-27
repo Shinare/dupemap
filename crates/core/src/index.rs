@@ -283,6 +283,15 @@ pub struct Rollup {
     pub stats: Vec<DirStats>,
 }
 
+/// The first 8 bytes of a hash's text (algorithms other than SHA-256 keep their hash as text),
+/// big-endian, padded with zeros: what [`Index::contents_with_prefix`] compares.
+pub fn text_prefix(text: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = text.len().min(8);
+    b[..n].copy_from_slice(&text[..n]);
+    u64::from_be_bytes(b)
+}
+
 pub struct Index {
     sources: Vec<SourceInfo>,
     source_by_db: HashMap<i64, SourceIx>,
@@ -313,6 +322,9 @@ pub struct Index {
     // contents, numbered in order of first appearance in the tree (cache locality)
     hot: Vec<ContentHot>,
     content_size: Vec<u64>,
+    /// The first 8 bytes of each SHA-256 content's hash (big-endian; 0 for other algorithms):
+    /// finds a hash without reading the file table.
+    content_prefix: Vec<u64>,
     content_file_start: Vec<u32>,
     content_files: Vec<u32>,
     content_src: Vec<(SourceIx, u32)>,
@@ -608,6 +620,7 @@ impl Index {
         let mut r_content: Vec<u32> = vec![NONE; nr];
         let mut content_algo: Vec<u16> = Vec::new();
         let mut content_size: Vec<u64> = Vec::new();
+        let mut content_prefix: Vec<u64> = Vec::new();
         {
             let is_other: HashSet<u32> = other_digest.iter().map(|(i, _)| *i).collect();
             let mut keys: Vec<(u64, u32)> = (0..nr as u32)
@@ -649,6 +662,7 @@ impl Index {
                     let cid = content_algo.len() as u32;
                     content_algo.push(ALGO_SHA256 as u16);
                     content_size.push(r_size[first]);
+                    content_prefix.push(u64::from_be_bytes(r_digest[first][..8].try_into().unwrap()));
                     let mut m = k;
                     while m < run.len() {
                         let x = run[m].1 as usize;
@@ -683,6 +697,7 @@ impl Index {
                     let cid = content_algo.len() as u32;
                     content_algo.push(r_algo[i]);
                     content_size.push(r_size[i]);
+                    content_prefix.push(text_prefix(&key.1));
                     cid
                 });
                 if r_size[i] != UNKNOWN_SIZE {
@@ -755,7 +770,7 @@ impl Index {
         drop(r_content);
         // Renumber contents by first appearance in tree order. Backups copy whole folders, so
         // the copies then also have increasing ids, which keeps rollups cache-friendly.
-        let (content_algo, content_size) = {
+        let (content_algo, content_size, content_prefix) = {
             let mut remap = vec![NONE; nc];
             let mut next = 0u32;
             for c in file_content.iter_mut() {
@@ -768,12 +783,14 @@ impl Index {
             }
             let mut algo2 = vec![0u16; nc];
             let mut size2 = vec![0u64; nc];
+            let mut prefix2 = vec![0u64; nc];
             for old in 0..nc {
                 let n = remap[old] as usize;
                 algo2[n] = content_algo[old];
                 size2[n] = content_size[old];
+                prefix2[n] = content_prefix[old];
             }
-            (algo2, size2)
+            (algo2, size2, prefix2)
         };
         let file_ext: Vec<u32> = perm.iter().map(|&r| r_ext[r as usize]).collect();
         drop(r_ext);
@@ -883,6 +900,7 @@ impl Index {
             dirs_by_db: std::sync::OnceLock::new(),
             hot,
             content_size,
+            content_prefix,
             content_file_start,
             content_files,
             content_src,
@@ -1119,6 +1137,24 @@ impl Index {
     /// Copies of a content anywhere.
     pub fn copies(&self, c: ContentIx) -> u32 {
         self.hot[c as usize].copies
+    }
+
+    /// Contents whose hash starts with `value` in the bits of `mask`, both over the first 8 bytes
+    /// of the hash (big-endian): the bytes of a SHA-256, the text of other hashes (see
+    /// [`text_prefix`]). `algo` picks the algorithms. In content order.
+    pub fn contents_with_prefix(&self, value: u64, mask: u64, algo: impl Fn(u16) -> bool) -> Vec<ContentIx> {
+        let v = value & mask;
+        self.content_prefix
+            .iter()
+            .enumerate()
+            .filter(|&(c, &p)| p & mask == v && algo(self.hot[c].algo))
+            .map(|(c, _)| c as ContentIx)
+            .collect()
+    }
+
+    /// The id of an algorithm by its name (`md5`...), if any file uses it.
+    pub fn algo_id(&self, name: &str) -> Option<u16> {
+        self.algos.iter().position(|a| a == name).map(|i| i as u16)
     }
 
     pub fn content_size(&self, c: ContentIx) -> u64 {
@@ -1636,7 +1672,7 @@ impl Index {
             + names
             + v(self.children.len(), 4)
             + v(self.file_db.len(), 8 + 4 + 8 + 4 + 4 + 4)
-            + v(self.hot.len(), std::mem::size_of::<ContentHot>() + 8 + 4)
+            + v(self.hot.len(), std::mem::size_of::<ContentHot>() + 8 + 8 + 4)
             + v(self.content_src.len(), 8)
             + v(self.dup_order.len(), 4)
             + self.cache.lock().map(|c| c.len() * self.dir_db.len() * std::mem::size_of::<DirStats>()).unwrap_or(0)

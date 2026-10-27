@@ -58,6 +58,19 @@ jobs:
           set -o pipefail
           cargo build --workspace --release 2>&1 | tee "$RUNNER_TEMP/build.log"
 
+      - name: Check DupeMap.exe's icon and version information
+        id: exeinfo
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path .\target\release\DupeMap.exe).Path
+          $v = (Get-Item $exe).VersionInfo
+          $info = "description: $($v.FileDescription); file version: $($v.FileVersion); product: $($v.ProductName) $($v.ProductVersion); original name: $($v.OriginalFilename)"
+          Add-Type -Namespace Win -Name Shell -MemberDefinition '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, System.IntPtr[] large, System.IntPtr[] small, uint count);'
+          $icons = [Win.Shell]::ExtractIconEx($exe, -1, $null, $null, 0)
+          "$info; icons: $icons" | Tee-Object -FilePath "$env:RUNNER_TEMP\exeinfo.txt"
+          if ($v.FileDescription -ne 'DupeMap' -or $v.OriginalFilename -ne 'DupeMap.exe') { throw "DupeMap.exe has no version information" }
+          if ($icons -lt 1) { throw "DupeMap.exe has no icon" }
+
       - name: Smoke-test the tools on generated data
         id: smoke
         shell: pwsh
@@ -155,7 +168,8 @@ jobs:
             echo
             echo "- Commit: ${{ github.event.pull_request.head.sha }}"
             echo "- Toolchain: $(rustc --version 2>/dev/null)"
-            echo "- Steps: test **${{ steps.test.outcome }}**, build **${{ steps.build.outcome }}**, smoke test **${{ steps.smoke.outcome }}**, app screenshots **${{ steps.shots.outcome }}**"
+            echo "- Steps: test **${{ steps.test.outcome }}**, build **${{ steps.build.outcome }}**, exe icon and version **${{ steps.exeinfo.outcome }}**, smoke test **${{ steps.smoke.outcome }}**, app screenshots **${{ steps.shots.outcome }}**"
+            if [ -f "$RUNNER_TEMP/exeinfo.txt" ]; then echo "- DupeMap.exe: $(tr -d '\r' < "$RUNNER_TEMP/exeinfo.txt" | sed 's/^\xEF\xBB\xBF//')"; fi
             echo "- Screenshots: branch \`ci-shots/pr-${{ github.event.pull_request.number }}\`"
             echo "- Tests: $passed passed, $failed failed"
             if [ -f "$RUNNER_TEMP/bench.md" ]; then

@@ -251,7 +251,7 @@ impl Worker {
                                         s.1 = index;
                                     }
                                 } else {
-                                    match Db::open(&db_path) {
+                                    match Db::open_reader(&db_path) {
                                         Ok(db) => state = Some((generation, index, db, db_path)),
                                         Err(_) => state = None,
                                     }
@@ -439,7 +439,7 @@ fn spawn_search_thread(rtx: Sender<Reply>, repaint: Repaint, latest: Arc<Mutex<H
                                     s.1 = index;
                                 }
                             } else {
-                                state = Db::open(&db_path).ok().map(|db| (generation, index, db, db_path));
+                                state = Db::open_reader(&db_path).ok().map(|db| (generation, index, db, db_path));
                             }
                         }
                         Query::Search { pane, id, generation, query } => {
@@ -811,6 +811,8 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
     }
     // end with an index of whatever the database now holds
     set(p, "Building index", 0.0, repaint);
+    // the build reads the whole file table once: a large cache would only stay behind as memory
+    let _ = db.set_cache_kib(dupemap_core::db::READER_CACHE_KIB);
     match Index::build_with_progress(&db, &mut |stage, f| set(p, format!("Building index: {stage}"), f, repaint)) {
         Ok(ix) => {
             // folder statistics for the default view, computed here rather than on the UI thread

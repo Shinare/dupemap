@@ -121,6 +121,7 @@ pub struct DupeMapApp {
     reports: ReportWindow,
     ignore: Option<IgnoreEditor>,
     about: bool,
+    keys_open: bool,
     log_open: bool,
     notes: Vec<Note>,
     shot: Option<Shot>,
@@ -214,6 +215,7 @@ impl DupeMapApp {
             reports: ReportWindow::default(),
             ignore: None,
             about: false,
+            keys_open: false,
             log_open: false,
             notes: Vec::new(),
             shot: opts.screenshot.map(|path| {
@@ -333,8 +335,21 @@ impl DupeMapApp {
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         /// Captures in order: the main view, the duplicate groups, the summary, then one window at
         /// a time.
-        const SHOTS: [&str; 11] =
-            ["", "groups", "summary", "search", "marks", "export", "scan", "remote", "ignore", "report", "manifests"];
+        const SHOTS: [&str; 13] = [
+            "",
+            "groups",
+            "summary",
+            "search",
+            "marks",
+            "export",
+            "scan",
+            "remote",
+            "ignore",
+            "report",
+            "manifests",
+            "keys",
+            "about",
+        ];
         ctx.request_repaint();
         let image = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
@@ -389,6 +404,8 @@ impl DupeMapApp {
             self.scan_win.open = false;
             self.remote_win.open = false;
             self.export.open = false;
+            self.keys_open = false;
+            self.about = false;
             match stage {
                 0 => self.screenshot_layout(),
                 1 => self.process_simple(vec![Action::OpenGroups]),
@@ -412,7 +429,9 @@ impl DupeMapApp {
                 7 => self.remote_win.open = true,
                 8 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
                 9 => self.reports.open = true,
-                _ => self.manifests_win.open = true,
+                10 => self.manifests_win.open = true,
+                11 => self.keys_open = true,
+                _ => self.about = true,
             }
         } else if shot.prepared && shot.stage == 1 && !shot.picked && shot.idle_frames >= 3 {
             // select the biggest group: the inspector lists its copies, the tree highlights them
@@ -1281,6 +1300,20 @@ impl DupeMapApp {
                 }
             });
             ui.menu_button("Help", |ui| {
+                if ui.add(egui::Button::new("Keyboard shortcuts").shortcut_text("F1")).clicked() {
+                    self.keys_open = true;
+                    ui.close();
+                }
+                if cfg!(windows)
+                    && ui
+                        .button("Open data folder")
+                        .on_hover_text("The folder with DupeMap's database, its saved session, this PC's scans and the delete scripts")
+                        .clicked()
+                {
+                    actions.push(Action::Reveal(self.db_path.display().to_string()));
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("About DupeMap").clicked() {
                     self.about = true;
                     ui.close();
@@ -1475,30 +1508,146 @@ impl DupeMapApp {
         );
     }
 
-    fn about_window(&mut self, ctx: &egui::Context) {
+    fn about_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let mut open = self.about;
-        egui::Window::new("About DupeMap").open(&mut open).collapsible(false).resizable(false).default_width(460.0).show(ctx, |ui| {
-            ui.label(RichText::new(format!("DupeMap {}", env!("CARGO_PKG_VERSION"))).strong());
-            ui.label("Custom cross-machine duplicate file comparator based on hashes.");
-            ui.add_space(6.0);
-            ui.label(RichText::new("Works offline: no network access, no telemetry. DupeMap never deletes files; it only shows them and (later) writes scripts you review and run yourself.").color(colors::INK_SECONDARY));
-            ui.add_space(6.0);
-            ui.label(RichText::new(format!("Database: {}", self.db_path.display())).color(colors::INK_MUTED));
-            if let Some(ix) = &self.index {
+        egui::Window::new("About DupeMap").open(&mut open).collapsible(false).resizable(false).default_width(480.0).show(
+            ctx,
+            |ui| {
+                ui.label(RichText::new(format!("DupeMap {}", env!("CARGO_PKG_VERSION"))).strong());
+                ui.label("Finds duplicate files across computers, drives and cloud storage from hash manifests.");
+                ui.add_space(6.0);
                 ui.label(
-                    RichText::new(format!(
-                        "Index: {} folders · {} files · {} distinct contents · {} duplicate groups · ~{} in memory",
-                        format::count(ix.dir_count() as u64),
-                        format::count(ix.file_count() as u64),
-                        format::count(ix.content_count() as u64),
-                        format::count(ix.dup_group_count() as u64),
-                        format::bytes(ix.approx_memory() as u64)
-                    ))
-                    .color(colors::INK_MUTED),
+                    RichText::new(
+                        "Works offline: no network access, no telemetry. DupeMap never deletes files itself: it shows \
+                         them, and writes delete scripts that you review and run yourself.",
+                    )
+                    .color(colors::INK_SECONDARY),
                 );
-            }
-        });
+                ui.add_space(8.0);
+                let file_size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                let mut wal = self.db_path.as_os_str().to_owned();
+                wal.push("-wal");
+                let db_bytes = file_size(&self.db_path) + file_size(std::path::Path::new(&wal));
+                egui::Grid::new("about-files").striped(false).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                    ui.label(RichText::new("Database").color(colors::INK_MUTED));
+                    ui.label(
+                        RichText::new(format!("{} ({})", self.db_path.display(), format::bytes(db_bytes)))
+                            .color(colors::INK_SECONDARY),
+                    );
+                    ui.end_row();
+                    if let Some(f) = &self.session_file {
+                        ui.label(RichText::new("Session").color(colors::INK_MUTED));
+                        ui.label(RichText::new(f.path().display().to_string()).color(colors::INK_SECONDARY));
+                        ui.end_row();
+                    }
+                    if let Some(ix) = &self.index {
+                        ui.label(RichText::new("Index").color(colors::INK_MUTED));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} folders · {} files · {} distinct contents · {} duplicate groups · about {} in memory",
+                                format::count(ix.dir_count() as u64),
+                                format::count(ix.file_count() as u64),
+                                format::count(ix.content_count() as u64),
+                                format::count(ix.dup_group_count() as u64),
+                                format::bytes(ix.approx_memory() as u64)
+                            ))
+                            .color(colors::INK_SECONDARY),
+                        );
+                        ui.end_row();
+                    }
+                });
+                if cfg!(windows) {
+                    ui.add_space(6.0);
+                    if ui.button("Open data folder").clicked() {
+                        actions.push(Action::Reveal(self.db_path.display().to_string()));
+                    }
+                }
+            },
+        );
         self.about = open;
+    }
+
+    fn keys_window(&mut self, ctx: &egui::Context) {
+        const KEYS: [(&str, &[(&str, &str)]); 3] = [
+            (
+                "Anywhere",
+                &[
+                    ("Ctrl+O", "Import manifests"),
+                    ("Ctrl+F", "Search by name or hash"),
+                    ("Ctrl+G", "Duplicate groups"),
+                    ("Ctrl+U", "Summary by file type"),
+                    ("Ctrl+M", "Marked for deletion"),
+                    ("Ctrl+I", "Show or hide the inspector"),
+                    ("Ctrl+T", "New tab"),
+                    ("Ctrl+Z", "Undo a change to the marks"),
+                    ("Ctrl+Y", "Redo (also Ctrl+Shift+Z)"),
+                    ("F1", "These shortcuts"),
+                    ("Ctrl+Q", "Quit"),
+                ],
+            ),
+            (
+                "In a tree",
+                &[
+                    ("↑ ↓ PgUp PgDn Home End", "Move"),
+                    ("→", "Expand a folder, or go into it"),
+                    ("←", "Collapse a folder, or go to the parent"),
+                    ("Enter or Space", "Expand or collapse"),
+                    ("Ctrl+C", "Copy the path"),
+                    ("Del", "Mark or unmark for deletion"),
+                ],
+            ),
+            (
+                "In search results and duplicate groups",
+                &[
+                    ("↑ ↓ PgUp PgDn Home End", "Move"),
+                    ("Enter", "Show it in a tab (the first copy of a group)"),
+                    ("Del", "Mark or unmark for deletion (search results)"),
+                ],
+            ),
+        ];
+        let mut open = self.keys_open;
+        // near the top, and on a short screen the list scrolls rather than run off the bottom
+        let screen = ctx.content_rect();
+        let max_height = (screen.height() - 150.0).max(160.0);
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_TOP)
+            .default_pos(egui::pos2(screen.center().x, screen.top() + 56.0))
+            .show(ctx, |ui| {
+                // (a window that sizes itself gives a scroll area only egui's default 400 px)
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .min_scrolled_height(max_height)
+                    .show(ui, |ui| Self::keys_list(ui, &KEYS));
+            });
+        self.keys_open = open;
+    }
+
+    fn keys_list(ui: &mut Ui, groups: &[(&str, &[(&str, &str)])]) {
+        for (i, (title, keys)) in groups.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(8.0);
+            }
+            ui.label(RichText::new(*title).strong().color(colors::INK));
+            egui::Grid::new(("keys", i)).striped(false).num_columns(2).spacing([16.0, 3.0]).min_col_width(170.0).show(
+                ui,
+                |ui| {
+                    for (key, what) in keys.iter() {
+                        ui.label(RichText::new(*key).monospace().color(colors::INK));
+                        ui.label(RichText::new(*what).color(colors::INK_SECONDARY));
+                        ui.end_row();
+                    }
+                },
+            );
+        }
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Right-click a folder or file for everything else you can do with it.")
+                .small()
+                .color(colors::INK_MUTED),
+        );
     }
 
     fn log_window(&mut self, ctx: &egui::Context) {
@@ -1540,6 +1689,9 @@ impl DupeMapApp {
         }
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::M))) {
             actions.push(Action::OpenMarks);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) {
+            self.keys_open = !self.keys_open;
         }
         let (open, tab, quit, groups, inspector, summary, find) = ctx.input_mut(|i| {
             (
@@ -1721,7 +1873,10 @@ impl eframe::App for DupeMapApp {
         let scripts_dir = self.db_path.parent().map(PathBuf::from).unwrap_or_default();
         self.remote_win.show(&ctx, Some(frame), &scripts_dir, &mut actions);
         if self.about {
-            self.about_window(&ctx);
+            self.about_window(&ctx, &mut actions);
+        }
+        if self.keys_open {
+            self.keys_window(&ctx);
         }
         if self.log_open {
             self.log_window(&ctx);
