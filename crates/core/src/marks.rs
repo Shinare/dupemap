@@ -205,7 +205,7 @@ pub struct MarkTotals {
 }
 
 impl MarkTotals {
-    fn add(&mut self, bytes: u64, last: bool) {
+    pub(crate) fn add(&mut self, bytes: u64, last: bool) {
         self.files += 1;
         self.bytes += bytes;
         if last {

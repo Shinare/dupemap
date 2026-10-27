@@ -7,12 +7,14 @@
 //! * [`scripts`] makes the same scan as a script for other computers (Windows or Linux).
 //! * [`search`] finds files and folders by name, or files by hash.
 //! * [`sessionfile`] is the crash-safe file the app autosaves its session to.
+//! * [`export`] turns the marks into delete scripts per source (DupeMap never deletes itself).
 //! * [`marks`] works out what marks for deletion mark, and what would lose its last copy.
 //! * [`summary`] totals by file type (editable categories of extensions) and by source.
 //! * [`synth`] generates realistic synthetic manifests for tests and benchmarks.
 
 pub mod db;
 pub mod error;
+pub mod export;
 pub mod ignore;
 pub mod index;
 pub mod manifest;
