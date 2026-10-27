@@ -70,6 +70,10 @@ pub struct SearchResult {
 struct NamePattern {
     /// `LIKE` pattern (escape character `\`), folded (lower case, no accents).
     like: String,
+    /// The folded text, for names `LIKE` cannot fold.
+    folded: String,
+    /// `*` and `?` are wildcards and the whole name has to match.
+    glob: bool,
 }
 
 impl NamePattern {
@@ -99,15 +103,22 @@ impl NamePattern {
         if !glob {
             like.push('%');
         }
-        Ok(NamePattern { like })
+        Ok(NamePattern { like, folded: t, glob })
     }
 
-    /// Plain ASCII names are compared directly (`LIKE` folds ASCII case); names with any other
-    /// character go through the folding function.
+    /// The same match in Rust, on a folded name.
+    fn matches_folded(&self, name: &str) -> bool {
+        if self.glob {
+            glob_match(self.folded.as_bytes(), name.as_bytes())
+        } else {
+            name.contains(self.folded.as_str())
+        }
+    }
+
+    /// `LIKE` compares plain ASCII names (it folds ASCII case); names with any other character
+    /// are folded and compared by `dupemap_match`.
     fn condition(&self, column: &str) -> String {
-        format!(
-            "({column} LIKE ?1 ESCAPE '\\' OR ({column} GLOB '*[^ -~]*' AND dupemap_fold({column}) LIKE ?1 ESCAPE '\\'))"
-        )
+        format!("({column} LIKE ?1 ESCAPE '\\' OR dupemap_match({column}))")
     }
 }
 
@@ -115,6 +126,12 @@ impl NamePattern {
 /// `Œuvre` → `oeuvre`, `Straße` → `strasse`. Letters without a plain form stay (lower-cased).
 pub fn fold_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    fold_into(s, &mut out);
+    out
+}
+
+/// [`fold_text`] into a buffer.
+fn fold_into(s: &str, out: &mut String) {
     for c in s.chars().flat_map(char::to_lowercase) {
         let plain = match c {
             'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
@@ -147,7 +164,6 @@ pub fn fold_text(s: &str) -> String {
         };
         out.push_str(plain);
     }
-    out
 }
 
 /// What a hash search looks for.
@@ -222,7 +238,7 @@ pub fn search(
     match q.mode {
         SearchMode::Name => {
             let pat = NamePattern::parse(&q.text)?;
-            register_fold(db)?;
+            register_matcher(db, &pat)?;
             if q.what != SearchWhat::Files {
                 let sql = format!("SELECT id, name FROM dir WHERE parent_id IS NOT NULL AND {}", pat.condition("name"));
                 let mut st = db.conn().prepare(&sql)?;
@@ -304,18 +320,63 @@ fn collect_files(
     Ok(())
 }
 
-/// The folding used for names with characters other than plain ASCII.
-fn register_fold(db: &Db) -> Result<()> {
-    db.conn().create_scalar_function(
-        "dupemap_fold",
-        1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let s = ctx.get_raw(0).as_str().map(fold_text).unwrap_or_default();
-            Ok(s)
-        },
-    )?;
+/// `dupemap_match(name)`: the search's match for names with characters other than plain ASCII
+/// (folded first). Registered again for every search.
+fn register_matcher(db: &Db, pat: &NamePattern) -> Result<()> {
+    thread_local! {
+        static BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    let pat = pat.clone();
+    db.conn().create_scalar_function("dupemap_match", 1, FunctionFlags::SQLITE_UTF8, move |ctx| {
+        let Ok(name) = ctx.get_raw(0).as_str() else { return Ok(false) };
+        // plain ASCII names were compared by LIKE already
+        if name.is_ascii() {
+            return Ok(false);
+        }
+        Ok(BUF.with(|b| {
+            let mut buf = b.borrow_mut();
+            buf.clear();
+            fold_into(name, &mut buf);
+            pat.matches_folded(&buf)
+        }))
+    })?;
     Ok(())
+}
+
+/// `*` any run of characters, `?` one character (UTF-8 aware), the rest literally.
+fn glob_match(pat: &[u8], text: &[u8]) -> bool {
+    let char_len = |b: u8| match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    };
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pat.len() && pat[p] == b'?' {
+            p += 1;
+            t += char_len(text[t]).min(text.len() - t);
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some((p, t));
+            p += 1;
+        } else if p < pat.len() && pat[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some((sp, st)) = star {
+            // let the star take one more character
+            let next = st + char_len(text[st]).min(text.len() - st);
+            star = Some((sp, next));
+            p = sp + 1;
+            t = next;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 /// Is this text a full SHA-256 (64 hex digits)? The app switches to a hash search for it.
@@ -395,6 +456,19 @@ mod tests {
         assert_eq!(names(&db, &ix, name("swinoujscie plaza")).len(), 2);
         assert_eq!(names(&db, &ix, name("*plaza.jpg")).len(), 2);
         assert_eq!(fold_text("Œuvre Straße ĄĆĘŁŃÓŚŹŻ"), "oeuvre strasse acelnoszz");
+    }
+
+    #[test]
+    fn wildcard_matching() {
+        let m = |p: &str, t: &str| glob_match(p.as_bytes(), t.as_bytes());
+        assert!(m("*.mkv", "a b.mkv"));
+        assert!(!m("*.mkv", "a.mkv.part"));
+        assert!(m("img_20??.jpg", "img_2019.jpg"));
+        assert!(m("?ółw", "żółw"), "? is one character, not one byte");
+        assert!(!m("?", "żż"));
+        assert!(m("*a*b*", "xxaxxbxx"));
+        assert!(m("*", ""));
+        assert!(!m("a", ""));
     }
 
     #[test]
