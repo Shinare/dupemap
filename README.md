@@ -4,8 +4,9 @@ Custom cross-machine duplicate file comparator based on hashes.
 
 Explore and compare file-hash manifests from several machines, find duplicates, and (later
 phases) export delete scripts. Windows desktop app in Rust. Done so far: the test-data generator,
-the core library with three command-line tools (Phases 0–1), the app shell (Phase 2) and the
-compare features: inspector, linked highlighting, filters and duplicate groups (Phase 3).
+the core library with three command-line tools (Phases 0–1), the app shell (Phase 2), the
+compare features: inspector, linked highlighting, filters and duplicate groups (Phase 3), and the
+summary by file type with editable categories (Phase 4).
 
 ## Layout
 
@@ -46,12 +47,14 @@ target\release\DupeMap.exe
   file, every copy anywhere including itself (pill colour: 2, 3, 4–5, 6+); for a folder, how many of
   its files have another copy. *Elsewhere* — for a file, copies in **other** sources; for a folder,
   the share of its bytes that also exist outside it (✔ all = every file has a copy outside).
-  Unique files are dimmed. Sort by Name or Size by clicking the header; drag header edges to resize.
+  Unique files are dimmed. Click any column header to sort by it (again to reverse; numbers sort
+  largest first): Copies sorts folders by how many of their files have a copy, Elsewhere by the
+  share of their bytes also found outside them. Drag header edges to resize.
   A narrow tab (split views, small screens) drops columns to keep the names readable: Files first,
   then Copies, then Elsewhere; the inspector and tooltips still show everything.
 * **Keyboard**: ↑ ↓ PgUp PgDn Home End move, → expands, ← collapses or goes to the parent,
-  Enter toggles, Ctrl+C copies the path. Ctrl+G opens the duplicate groups, Ctrl+I shows or hides
-  the inspector.
+  Enter toggles, Ctrl+C copies the path. Ctrl+G opens the duplicate groups, Ctrl+U the summary by
+  file type, Ctrl+I shows or hides the inspector.
 * **Right-click** a folder or file: copy path or name, show in Explorer (for paths on this PC),
   expand or collapse everything below, **ignore this folder**, *Show every copy* / *Where are the
   copies?* (opens the inspector).
@@ -72,8 +75,20 @@ target\release\DupeMap.exe
 * **Duplicate groups** (View → Duplicate groups): every set of identical files, the most space in
   extra copies first (extra copies = every copy beyond one). Narrow it to groups with a copy on a
   chosen source, groups within one source or across sources, 3+ copies, or flagged hashes.
-  Selecting a group lists its copies in the inspector; double-click or Enter opens the first copy
-  in a tab.
+  Click a column header to sort by size of each copy, copies, sources or extra copies. Selecting a
+  group lists its copies in the inspector; double-click or Enter opens the first copy in a tab.
+* **Summary by file type** (View → Summary by file type, Ctrl+U, or right-click a source): the
+  total size of a source, or of all of them, split three ways — *Elsewhere* (the file has a copy
+  in another source; solid orange), *Same source* (it has copies, but only within its own source;
+  striped orange) and *Unique* (the only copy anywhere; grey). Then the same split by source (click
+  one to summarise it), by category (click a category to see its extensions) and by extension.
+  Every column sorts.
+* **File type categories** (View → File type categories…, or *Categories…* in a summary): a
+  category is a list of extensions. Rename, reorder, add or remove categories, edit their
+  extensions, or pick from the largest extensions that are in no category yet ("Other").
+  Right-click an extension in a summary to count it under another category. Saved in the database;
+  *Restore defaults* brings back the built-in list (video, audio, images, documents, archives, disk
+  images & backups, software, development, databases, game data).
 * **Manifests** (File → Manifests): *Open folder* opens the folder holding a manifest file.
 * **Ignored folders** (File → Ignored folders): folders matching a rule are left out completely —
   not shown, not counted, and their files never count as copies. Windows system folders, Program

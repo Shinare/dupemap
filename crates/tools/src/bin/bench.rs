@@ -5,7 +5,7 @@
 //! Generates manifests, imports them into a database file, builds the index and times what the
 //! app does on start-up and on common interactions. Prints a Markdown table.
 
-use dupemap_core::index::{CopiesFilter, DupQuery, Filter, Index, ListOptions, Node, SortKey, Spread};
+use dupemap_core::index::{CopiesFilter, DupQuery, Filter, GroupSort, Index, ListOptions, Node, SortKey, Spread};
 use dupemap_core::synth::{generate, Config};
 use dupemap_core::Db;
 use std::path::{Path, PathBuf};
@@ -222,6 +222,13 @@ fn main() {
     let (deep_total, deep) = ix.dup_groups(&DupQuery::default(), total.saturating_sub(200) / 2, 200);
     t.ms(&format!("duplicate groups: a page of 200 halfway down ({} rows)", deep.len()), s);
     assert_eq!(deep_total, total);
+    let s = Instant::now();
+    let by_size = DupQuery { sort: GroupSort::Each, ..Default::default() };
+    let _ = ix.dup_groups(&by_size, 0, 200);
+    t.ms("duplicate groups sorted by size of each copy: first page (sorts every group)", s);
+    let s = Instant::now();
+    let _ = ix.dup_groups(&by_size, 1000, 200);
+    t.ms("same order, another page (cached)", s);
     let s = Instant::now();
     let across = ix.dup_totals(&DupQuery { spread: Spread::SeveralSources, ..Default::default() });
     t.ms(&format!("duplicate groups across sources: count and extra bytes ({} groups)", across.0), s);

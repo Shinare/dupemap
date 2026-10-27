@@ -29,7 +29,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     (
         "Video",
         "mp4 mkv avi mov wmv m4v mpg mpeg mpe m2ts mts ts vob webm flv f4v 3gp 3g2 divx xvid ogv rm rmvb asf mxf dv \
-         h264 h265 hevc m2v",
+         h264 h265 hevc m2v crm braw r3d insv lrv",
     ),
     ("Audio", "mp3 flac wav m4a aac ogg oga opus wma aif aiff alac ape dsf dff mka wv mid midi m4b amr ac3 dts mpc"),
     (
@@ -45,7 +45,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     (
         "Archives",
         "zip zipx 7z rar tar tar.gz tgz tar.bz2 tbz tbz2 tar.xz txz tar.zst tar.lz tar.lzma gz bz2 xz zst lz lzma \
-         lz4 cab arj lzh lha z sit sitx ace cpio",
+         lz4 cab arj lzh lha z sit sitx ace cpio 001",
     ),
     (
         "Disk images & backups",
@@ -60,7 +60,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     (
         "Development",
         "pdb lib a o obj pch ipch rlib rmeta class jar war ear whl nupkg node wasm pyd pyc ilk idb exp bc tlog \
-         dmp mdmp core hprof",
+         dmp mdmp core hprof pack",
     ),
     ("Databases", "db sqlite sqlite3 db3 mdb accdb sql dbf frm ibd myd myi ldf ndf realm kdbx edb wal journal"),
     (
