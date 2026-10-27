@@ -2,13 +2,14 @@
 
 Custom cross-machine duplicate file comparator based on hashes.
 
-Explore and compare file-hash manifests from several machines, find duplicates, and (later
-phases) export delete scripts. Windows desktop app in Rust. Done so far: the test-data generator,
-the core library with command-line tools (Phases 0–1), the app shell (Phase 2), the compare
-features: inspector, linked highlighting, filters and duplicate groups (Phase 3), the summary by
-file type with editable categories (Phase 4), the saved session (Phase 5), and: scanning this PC
-from the app, scan scripts for other computers, search by name or hash, and importing checksum
-lists (`sha256sum` / `rclone hashsum` output).
+Explore and compare file-hash manifests from several machines, find duplicates, mark what to
+delete and export delete scripts. Windows desktop app in Rust. Done so far: the test-data
+generator, the core library with command-line tools (Phases 0–1), the app shell (Phase 2), the
+compare features: inspector, linked highlighting, filters and duplicate groups (Phase 3), the
+summary by file type with editable categories (Phase 4), the saved session (Phase 5), scanning
+this PC from the app, scan scripts for other computers, search by name or hash, importing
+checksum lists (`sha256sum` / `rclone hashsum` output), and marking for deletion with delete
+scripts per source (Phase 6).
 
 ## Layout
 
@@ -93,8 +94,9 @@ target\release\DupeMap.exe
   A narrow tab (split views, small screens) drops columns to keep the names readable: Files first,
   then Copies, then Elsewhere; the inspector and tooltips still show everything.
 * **Keyboard**: ↑ ↓ PgUp PgDn Home End move, → expands, ← collapses or goes to the parent,
-  Enter toggles, Ctrl+C copies the path. Ctrl+F searches, Ctrl+G opens the duplicate groups,
-  Ctrl+U the summary by file type, Ctrl+I shows or hides the inspector.
+  Enter toggles, Ctrl+C copies the path, Del marks or unmarks for deletion. Ctrl+F searches,
+  Ctrl+G opens the duplicate groups, Ctrl+U the summary by file type, Ctrl+M the marks, Ctrl+I
+  shows or hides the inspector, Ctrl+Z / Ctrl+Y undo and redo marks.
 * **Right-click** a folder or file: copy path or name, show in Explorer (for paths on this PC),
   expand or collapse everything below, **ignore this folder**, *Show every copy* / *Where are the
   copies?* (opens the inspector).
@@ -138,6 +140,33 @@ target\release\DupeMap.exe
   drive), `**\node_modules` (anywhere), `/mnt/tank/.recycle`, `gdrive:/Trash`. Matching ignores
   case. Changes apply when you press Apply (the index is rebuilt; nothing is re-imported).
 
+* **Marking for deletion**: right-click a folder or file (in a tree, the search results or the
+  inspector's list of copies) and *Mark for deletion*, or press Del on the selected row. A folder
+  can be marked whole, or only *its files that have a copy outside it*; *Keep* makes an exception
+  inside a marked folder. The most specific mark decides (a file's own mark beats its folder's, a
+  deeper folder beats a shallower one). Marked files are struck through with a bin in every tab,
+  a folder with marks below it shows a small bin, the duplicate groups say how many copies of each
+  file are marked. A file of which **every copy is marked** would be gone for good: it is flagged
+  "⚠ last copy" everywhere and left out of the scripts unless you ask. Marks are saved in the
+  database by source and path, so they survive re-importing; Edit → Undo / Redo (Ctrl+Z / Ctrl+Y).
+* **Marks tab** (Edit → Marked for deletion, Ctrl+M, or the *Marked* total in the status bar):
+  how much is marked, the folders holding last copies, and every mark per source with what it
+  marks, *Show* and ✕.
+* **Delete scripts** (File → Write delete scripts…, or in the Marks tab). **DupeMap never deletes
+  anything itself**: it writes one script per source, which you run on the computer that has
+  those files, plus a plain list of the paths if you like.
+  * Windows drives (PowerShell): to the Recycle Bin, into a `_DupeMap deleted\<date>` folder at
+    the top of the drive, or for good. It checks the drive's label first (a USB drive may have
+    another letter: `-Drive G:`), handles paths over 260 characters, and moves files on network
+    drives and USB sticks (no Recycle Bin there) instead.
+  * Linux / TrueNAS (bash): into `_dupemap_deleted/<date>` at the top of each file system (on ZFS
+    the dataset; no space is freed until you delete it, and snapshots keep the space until they go)
+    or for good with `rm`; it runs only on the computer of that name, works with names that are not
+    UTF-8, and leaves alone links and files with other hard links (removing those frees nothing).
+  * Cloud drives (PowerShell with rclone): `rclone delete` into the trash / recycle bin by default.
+  * Every script first checks each file (still there, same size, optionally the same SHA-256),
+    shows what it will do and asks you to type YES; `-DryRun` / `--dry-run` only shows; a log of
+    everything is written next to it.
 * **Your session is kept.** The app saves what you had open, about a second after every change, and
   restores it at the next start: the tabs and how they are split, per tab the source, sort,
   filters, expanded folders, selected row and scroll position, the inspector (open or not, its
@@ -159,7 +188,7 @@ another one. `DupeMap.exe --db C:\tmp\demo.db --demo 1000000` fills a separate d
 generated demo data, and `--window 1024x768` opens the window at that size (to try small
 screens; it overrides the saved window size); `--scan` opens *Scan this PC* at start. The app
 only reads files (manifests, and the drives you scan); it has no network access and never deletes
-anything.
+anything: deleting is done by the scripts it writes, when you run them.
 
 ## Try it on your manifests (command line)
 

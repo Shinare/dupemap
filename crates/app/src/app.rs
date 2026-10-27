@@ -333,7 +333,8 @@ impl DupeMapApp {
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         /// Captures in order: the main view, the duplicate groups, the summary, then one window at
         /// a time.
-        const SHOTS: [&str; 9] = ["", "groups", "summary", "search", "scan", "remote", "ignore", "report", "manifests"];
+        const SHOTS: [&str; 11] =
+            ["", "groups", "summary", "search", "marks", "export", "scan", "remote", "ignore", "report", "manifests"];
         ctx.request_repaint();
         let image = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
@@ -349,6 +350,7 @@ impl DupeMapApp {
             && !self.summaries.is_pending()
             && !self.inspector.is_pending()
             && !self.scan_win.is_listing()
+            && !(self.marks.loaded && self.mark_state_for != (self.generation, self.marks.version))
             && !self.dock.iter_all_tabs().any(|(_, t)| matches!(&t.kind, TabKind::Search(p) if p.is_pending()));
         let Some(shot) = &mut self.shot else { return };
         if let Some(img) = image {
@@ -386,6 +388,7 @@ impl DupeMapApp {
             self.reports.open = false;
             self.scan_win.open = false;
             self.remote_win.open = false;
+            self.export.open = false;
             match stage {
                 0 => self.screenshot_layout(),
                 1 => self.process_simple(vec![Action::OpenGroups]),
@@ -403,10 +406,12 @@ impl DupeMapApp {
                         }
                     }
                 }
-                4 => self.scan_win.open(&self.ctx.clone()),
-                5 => self.remote_win.open = true,
-                6 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
-                7 => self.reports.open = true,
+                4 => self.screenshot_marks(),
+                5 => self.export.open(crate::marks_ui::default_export_dir(&self.db_path)),
+                6 => self.scan_win.open(&self.ctx.clone()),
+                7 => self.remote_win.open = true,
+                8 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
+                9 => self.reports.open = true,
                 _ => self.manifests_win.open = true,
             }
         } else if shot.prepared && shot.stage == 1 && !shot.picked && shot.idle_frames >= 3 {
@@ -439,6 +444,30 @@ impl DupeMapApp {
             shot.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
+    }
+
+    /// Marks to show in the screenshots: in the two largest sources, the largest folder two
+    /// levels below the drive; the first marked whole, the second only its files with a copy
+    /// outside it. Then the Marks tab.
+    fn screenshot_marks(&mut self) {
+        use dupemap_core::marks::{MarkAction, MarkRule};
+        let Some(ix) = self.index.clone() else { return };
+        let roll = ix.rollup(&dupemap_core::index::Filter::default());
+        let mut by_size: Vec<_> = ix.source_summaries().to_vec();
+        by_size.sort_by_key(|s| std::cmp::Reverse(s.bytes));
+        let mut add = Vec::new();
+        for s in by_size.iter().take(2) {
+            let mut d = ix.sources()[s.source as usize].root;
+            for _ in 0..3 {
+                match ix.dir_children(d).iter().copied().max_by_key(|&c| roll.stats[c as usize].bytes) {
+                    Some(c) => d = c,
+                    None => break,
+                }
+            }
+            let action = if add.is_empty() { MarkAction::Delete } else { MarkAction::DeleteDuplicates };
+            add.push(MarkRule::for_dir(&ix, d, action));
+        }
+        self.process_simple(vec![Action::Mark { label: "mark".into(), add, remove: vec![] }, Action::OpenMarks]);
     }
 
     /// A representative layout: every source on the left with its biggest folder inspected, the
