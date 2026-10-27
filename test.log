@@ -1,0 +1,236 @@
+    Updating crates.io index
+     Locking 303 packages to highest compatible versions
+      Adding eframe v0.36.2 (available: v0.37.0)
+      Adding egui v0.36.2 (available: v0.37.0)
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding sha2 v0.10.9 (available: v0.11.1)
+   Compiling dupemap-core v0.1.0 (D:\a\dupemap\dupemap\crates\core)
+   Compiling dupemap-app v0.1.0 (D:\a\dupemap\dupemap\crates\app)
+   Compiling dupemap-tools v0.1.0 (D:\a\dupemap\dupemap\crates\tools)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 40s
+     Running unittests src\main.rs (target\release\deps\DupeMap-8d3da109fd915c01.exe)
+
+running 42 tests
+test actions::tests::host_matching ... ok
+test categories_ui::tests::duplicate_names_are_reported ... ok
+test colors::tests::copies_pills_are_ordered_and_labels_readable ... ok
+test colors::tests::ink_contrast_on_surfaces ... ok
+test colors::tests::oklab_round_trip ... ok
+test colors::tests::size_ramp_is_monotone_in_lightness_and_spans_the_stops ... ok
+test elevate::tests::arguments_are_quoted_for_windows ... ok
+test format::tests::formats ... ok
+test groups::tests::cache_tracks_pages_counts_and_generations ... ok
+test groups::tests::columns_keep_the_right_edge_and_a_usable_name ... ok
+test groups::tests::toolbar_rows_fill_the_width ... ok
+test ignore_ui::tests::adding_rules_validates_and_rejects_duplicates ... ok
+test ignore_ui::tests::rebase_keeps_unsaved_edits ... ok
+test ignore_ui::tests::restore_defaults_keeps_user_rules ... ok
+test pane::tests::columns_fit_and_resize_keeps_the_right_edge ... ok
+test categories_ui::tests::editing_round_trip ... ok
+test scan_ui::tests::durations_read_naturally ... ok
+test scan_ui::tests::remote_options_follow_the_ticks ... ok
+test search_ui::tests::columns_fit_and_give_way ... ok
+test search_ui::tests::enough_to_search ... ok
+test pane::tests::expand_below_opens_whole_levels_only ... ok
+test session::tests::a_focus_on_a_missing_tab_moves_to_a_tab_that_exists ... ok
+test selection::tests::linked_marks_every_folder_on_the_way_to_a_copy ... ok
+test session::tests::missing_optional_fields_use_defaults ... ok
+test session::tests::round_trip_keeps_tabs_layout_and_view_state ... ok
+test session::tests::unusable_sessions_are_refused ... ok
+test session::tests::window_values_are_made_sane ... ok
+test shot::tests::checksums ... ok
+test shot::tests::png_structure ... ok
+test summary_ui::tests::cache_keeps_current_results_only ... ok
+test summary_ui::tests::columns_fill_the_width_and_drop_in_order ... ok
+test summary_ui::tests::moving_an_extension_between_categories ... ok
+test tests::window_sizes ... ok
+test theme::tests::checkboxes_and_radio_buttons_are_visible ... ok
+test tree::tests::all_sources_collapsed_and_expanded ... ok
+test session::tests::saver_writes_the_newest_text_on_finish ... ok
+test tree::tests::expanding_follows_single_folder_chains ... ok
+test tree::tests::files_appear_once_loaded_and_follow_the_sort ... ok
+test widgets::tests::columns_shrink_toward_their_minimum_first ... ok
+test tree::tests::filters_hide_folders_without_matching_files ... ok
+test worker::tests::queries_are_prioritised ... ok
+test worker::tests::folders_expand_to_their_manifests ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src\lib.rs (target\release\deps\dupemap_core-6c2061863a2a20c1.exe)
+
+running 90 tests
+test db::tests::a_checksum_list_needs_a_source ... ok
+test db::tests::a_listing_with_a_size_beats_one_without ... ok
+test db::tests::a_size_list_fills_in_sizes ... ok
+test db::tests::basic_import_builds_sources_and_folders ... ok
+test db::tests::cancel_rolls_back ... ok
+test db::tests::checksum_list_rows_have_no_size_and_the_given_source ... ok
+test db::tests::checksum_paths_are_joined_to_the_base ... ok
+test db::tests::duplicate_listing_in_one_manifest_is_hidden ... ok
+test db::tests::malformed_and_flagged_rows_are_reported_with_samples ... ok
+test db::tests::missing_header_is_an_alert_but_rows_still_import ... ok
+test db::tests::newer_manifest_wins_and_removal_restores ... ok
+test db::tests::newer_scan_wins_even_when_imported_first ... ok
+test db::tests::non_utf8_names_are_kept_exactly ... ok
+test db::tests::older_schema_is_upgraded_and_newer_refused ... ok
+test db::tests::removal_prunes_folders_and_sources ... ok
+test db::tests::removal_with_three_overlapping_manifests ... ok
+test db::tests::reopen_file_database ... ok
+test db::tests::same_path_on_cloud_is_kept ... ok
+test db::tests::sha256_listing_beats_a_newer_flagged_one ... ok
+test db::tests::windows_folders_merge_case_insensitively_posix_do_not ... ok
+test ignore::tests::matching ... ok
+test ignore::tests::serde_round_trip_with_defaults ... ok
+test ignore::tests::splitting ... ok
+test ignore::tests::validation_and_defaults ... ok
+test index::tests::copies_and_sources ... ok
+test index::tests::database_ids_find_folders_and_files_again ... ok
+test index::tests::empty_database ... ok
+test index::tests::files_without_a_size_take_it_from_a_copy ... ok
+test index::tests::filters ... ok
+test index::tests::folder_statistics ... ok
+test index::tests::inspector_highlight_and_groups ... ok
+test index::tests::listings_sort_and_hide_empty_folders ... ok
+test index::tests::listings_sort_by_every_column ... ok
+test manifest::tests::checksum_lines ... ok
+test manifest::tests::crlf_and_bom ... ok
+test manifest::tests::flagged_algorithms ... ok
+test manifest::tests::format_detection ... ok
+test manifest::tests::guessing_the_source_of_a_checksum_list ... ok
+test manifest::tests::header_detection ... ok
+test manifest::tests::last_line_without_newline ... ok
+test manifest::tests::lf_file_keeps_a_trailing_carriage_return_in_a_name ... ok
+test manifest::tests::malformed_rows ... ok
+test manifest::tests::size_lists_next_to_a_checksum_list_are_found ... ok
+test manifest::tests::tabs_inside_the_path_stay_in_the_path ... ok
+test manifest::tests::uppercase_and_prefixed_sha256_are_sha256 ... ok
+test manifest::tests::utf16_le_and_be ... ok
+test manifest::tests::utf16_with_tiny_reads_and_broken_surrogate ... ok
+test manifest::tests::valid_row ... ok
+test natsort::tests::is_a_total_order_on_distinct_strings ... ok
+test natsort::tests::orders_like_a_file_browser ... ok
+test natsort::tests::polish_letters_sort_with_their_base_letter ... ok
+test paths::tests::anchor_kinds ... ok
+test paths::tests::cloud_with_and_without_leading_slash ... ok
+test paths::tests::extensions ... ok
+test paths::tests::keys_fold_case_only_on_windows ... ok
+test paths::tests::long_path_prefixes ... ok
+test paths::tests::non_utf8_components_keep_raw_bytes ... ok
+test paths::tests::posix_backslash_is_a_normal_character ... ok
+test paths::tests::relative_and_degenerate ... ok
+test paths::tests::round_trip_canonical_paths ... ok
+test paths::tests::unc ... ok
+test paths::tests::windows_drive ... ok
+test paths::tests::windows_forward_slashes_and_doubled_separators ... ok
+test scan::tests::a_cancelled_scan_keeps_its_partial_manifest ... ok
+test scan::tests::a_stop_interrupts_a_file_being_hashed ... ok
+test db::tests::a_second_connection_waits_for_a_writer ... ok
+test scan::tests::manifest_names ... ok
+test scan::tests::progress_rate_and_time_left ... ok
+test scan::tests::an_interrupted_scan_continues ... ok
+test scan::tests::scans_into_a_manifest_that_imports ... ok
+test scan::tests::the_manifest_being_written_is_not_hashed ... ok
+test scan::tests::this_computer_has_drives ... ok
+test scripts::tests::placeholders_are_filled ... ok
+test search::tests::by_hash_or_its_first_digits ... ok
+test search::tests::a_superseded_search_stops ... ok
+test search::tests::part_of_a_name_any_case ... ok
+test search::tests::letters_beyond_ascii_ignore_case_and_accents ... ok
+test search::tests::wildcard_matching ... ok
+test search::tests::scope_and_limit ... ok
+test search::tests::wildcards_match_whole_names ... ok
+test sessionfile::tests::interrupted_save_leaves_the_old_file ... ok
+test sessionfile::tests::named_after_the_database ... ok
+test sessionfile::tests::damaged_file_falls_back_to_the_backup ... ok
+test sessionfile::tests::remove_deletes_everything ... ok
+test summary::tests::defaults_are_clean_and_each_extension_is_in_one_category ... ok
+test summary::tests::normalising_an_edited_mapping ... ok
+test summary::tests::typed_extensions_are_normalised ... ok
+test sessionfile::tests::write_then_read ... ok
+test synth::tests::rng_is_uniform_enough ... ok
+test synth::tests::deterministic_and_close_to_target ... ok
+
+test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests\generated_import.rs (target\release\deps\generated_import-6c4574e24d5b8465.exe)
+
+running 1 test
+test reports_match_generator_expectations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests\index_bruteforce.rs (target\release\deps\index_bruteforce-0b4b431dcbbd9188.exe)
+
+running 3 tests
+test random_adversarial_trees ... ok
+test random_trees_with_ignore_rules ... ok
+test generated_household_data ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+
+     Running tests\real_manifests.rs (target\release\deps\real_manifests-83eae35c5c19182a.exe)
+
+running 1 test
+test real_manifests_round_trip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\summary_bruteforce.rs (target\release\deps\summary_bruteforce-67288d0e7c1a6623.exe)
+
+running 2 tests
+test random_sources_extensions_and_copies ... ok
+test generated_household_data ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests\windows_script.rs (target\release\deps\windows_script-b9797b03b6a449f2.exe)
+
+running 1 test
+Scanning D:\a\dupemap\dupemap\target\tmp\dupemap-ps-2980\data as 'runnervmdaln5 D: (Temporary Storage)'
+Done: 3 files, 0.0 GB this run -> D:\a\dupemap\dupemap\target\tmp\dupemap-ps-2980\manifest-script.tsv
+Copy the manifest to the computer with DupeMap and import it there (File > Import manifests).
+Continuing: 3 files are already in manifest-script.tsv
+Scanning D:\a\dupemap\dupemap\target\tmp\dupemap-ps-2980\data as 'runnervmdaln5 D: (Temporary Storage)'
+Done: 0 files, 0.0 GB this run -> D:\a\dupemap\dupemap\target\tmp\dupemap-ps-2980\manifest-script.tsv
+3 files were already in the manifest from the earlier run.
+Copy the manifest to the computer with DupeMap and import it there (File > Import manifests).
+Continuing: 2 files are already in manifest-script.tsv
+Scanning D:\a\dupemap\dupemap\target\tmp\dupemap-ps-2980\data as 'runnervmdaln5 D: (Temporary Storage)'
+Done: 1 files, 0.0 GB this run -> D:\a\dupemap\dupemap\target\tmp\dupemap-ps-2980\manifest-script.tsv
+2 files were already in the manifest from the earlier run.
+Copy the manifest to the computer with DupeMap and import it there (File > Import manifests).
+test the_windows_script_writes_what_the_app_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.21s
+
+     Running unittests src\bin\bench.rs (target\release\deps\dupemap_bench-c4ac823a1b99a2f6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\check.rs (target\release\deps\dupemap_check-00c781e2a9d8333d.exe)
+
+running 1 test
+test tests::wildcards ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\gen.rs (target\release\deps\dupemap_gen-68a6f73f1b24cc3d.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\bin\scan.rs (target\release\deps\dupemap_scan-3bc9e1d8d0ee204e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests dupemap_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
