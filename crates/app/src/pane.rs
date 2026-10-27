@@ -105,6 +105,9 @@ pub struct PaneCtx<'a> {
     pub alert_hosts: &'a BTreeSet<String>,
     /// Copies of the app-wide selection, highlighted in every tab.
     pub linked: Option<&'a Linked>,
+    /// Marks for deletion: the rules, and what they mark (`None` while worked out).
+    pub book: &'a crate::marks_ui::MarkBook,
+    pub marks: Option<&'a dupemap_core::marks::MarkState>,
 }
 
 enum Event {
@@ -777,6 +780,17 @@ impl TreePane {
         } else if i % 2 == 1 {
             p.rect_filled(rect, CornerRadius::ZERO, colors::ROW_STRIPE);
         }
+        // marked for deletion: a red tint (under the selection and the copies' highlight)
+        let (marked, last) = match (cx.marks, row.kind, file) {
+            (Some(m), RowKind::File { .. }, Some(f)) => (m.is_marked(f.file), m.is_last_copy(f.file)),
+            (Some(m), RowKind::Dir { dir, .. }, _) => {
+                (crate::marks_ui::dir_fully_marked(ix, m, dir), m.dir(dir).last_files > 0)
+            }
+            _ => (false, false),
+        };
+        if marked && !selected && !resp.hovered() && link == 0 {
+            p.rect_filled(rect, CornerRadius::ZERO, colors::alpha(colors::CRITICAL, if last { 0.16 } else { 0.09 }));
+        }
         if link > 0 && !selected {
             // a marker as well as the tint, so the highlight does not rely on colour alone
             let w = if link == 2 { 4.0 } else { 2.0 };
@@ -832,8 +846,30 @@ impl TreePane {
                         );
                     }
                 } else {
-                    widgets::folder_icon(&p, icon_rect, colors::INK_MUTED);
-                    widgets::text_left(&p, name_rect, ix.dir_name(dir), font.clone(), colors::INK);
+                    let dm = cx.marks.map(|m| m.dir(dir)).unwrap_or_default();
+                    let icon_ink = if marked { colors::CRITICAL } else { colors::INK_MUTED };
+                    widgets::folder_icon(&p, icon_rect, icon_ink);
+                    let (nr, tag) =
+                        self.rule_tag(&p, ix, cx, dupemap_core::marks::Place::Dir(dir), name_rect, &small, rect);
+                    let r = widgets::text_left(
+                        &p,
+                        nr,
+                        ix.dir_name(dir),
+                        font.clone(),
+                        if marked { colors::INK_SECONDARY } else { colors::INK },
+                    );
+                    if marked {
+                        strike(&p, r);
+                    } else if dm.files > 0 && tag.is_none() {
+                        // some files below are marked: a small bin after the name
+                        let ir = Rect::from_center_size(
+                            Pos2::new(r.right() + 10.0, rect.center().y),
+                            Vec2::new(14.0, ROW_H),
+                        );
+                        if ir.right() < name_rect.right() {
+                            widgets::trash_icon(&p, ir, colors::alpha(colors::CRITICAL, 0.85));
+                        }
+                    }
                 }
                 size_cell(&p, cols.size, rect, st.bytes, row.parent_bytes, false);
                 if cols.shown[1] {
@@ -880,8 +916,26 @@ impl TreePane {
                 let Some(f) = file else { return };
                 let unique = f.copies <= 1;
                 let ink = if unique { colors::INK_MUTED } else { colors::INK };
-                widgets::file_icon(&p, icon_rect, colors::INK_MUTED);
-                let mut nr = name_rect;
+                if marked {
+                    widgets::trash_icon(&p, icon_rect, colors::CRITICAL);
+                } else {
+                    widgets::file_icon(&p, icon_rect, colors::INK_MUTED);
+                }
+                let (mut nr, _) =
+                    self.rule_tag(&p, ix, cx, dupemap_core::marks::Place::File(f.file), name_rect, &small, rect);
+                if last {
+                    let t = widgets::tag(
+                        &p,
+                        Pos2::new(nr.right() - 74.0, rect.center().y),
+                        "⚠ last copy",
+                        small.clone(),
+                        colors::INK,
+                        colors::CRITICAL,
+                    );
+                    if nr.width() > t.width() + 80.0 {
+                        nr.max.x = t.left() - 6.0;
+                    }
+                }
                 if f.flagged {
                     // flagged rows never mix with SHA-256 matches; say so next to the name
                     let algo = ix.content_algo_name(f.content).to_uppercase();
@@ -900,7 +954,11 @@ impl TreePane {
                         nr.max.x -= tw + 6.0;
                     }
                 }
-                widgets::text_left(&p, nr, &f.name, font.clone(), ink);
+                let r =
+                    widgets::text_left(&p, nr, &f.name, font.clone(), if marked { colors::INK_SECONDARY } else { ink });
+                if marked {
+                    strike(&p, r);
+                }
                 if ix.size_state(f.file) == dupemap_core::index::SizeState::Unknown {
                     // a checksum list without sizes, and no copy with one
                     widgets::text_right(&p, inner(cols.size, rect), "?", FontId::proportional(13.0), colors::INK_MUTED);
@@ -950,9 +1008,54 @@ impl TreePane {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// A tag at the right of the name for a node with its own mark ("delete", "copies",
+    /// "keep"); returns the room left for the name and the tag's rectangle.
+    fn rule_tag(
+        &self,
+        p: &egui::Painter,
+        ix: &Index,
+        cx: &PaneCtx,
+        place: dupemap_core::marks::Place,
+        name_rect: Rect,
+        small: &FontId,
+        rect: Rect,
+    ) -> (Rect, Option<Rect>) {
+        let _ = ix;
+        let Some(st) = cx.marks else { return (name_rect, None) };
+        let Some(i) = st.rule_at(place) else { return (name_rect, None) };
+        // the state can be one edit behind the rules for a moment: then no tag
+        if st.rules.len() != cx.book.rules().len() {
+            return (name_rect, None);
+        }
+        let (text, stroke) = match cx.book.rules()[i].action {
+            dupemap_core::marks::MarkAction::Delete => ("delete", colors::CRITICAL),
+            dupemap_core::marks::MarkAction::DeleteDuplicates => ("delete copies", colors::CRITICAL),
+            dupemap_core::marks::MarkAction::Keep => ("keep", colors::GOOD),
+        };
+        let g = p.layout_no_wrap(text.to_string(), small.clone(), colors::INK);
+        let w = g.size().x + 10.0;
+        if name_rect.width() < w + 70.0 {
+            return (name_rect, None);
+        }
+        let t = widgets::tag(
+            p,
+            Pos2::new(name_rect.right() - w, rect.center().y),
+            text,
+            small.clone(),
+            colors::INK,
+            stroke,
+        );
+        let mut nr = name_rect;
+        nr.max.x = t.left() - 6.0;
+        (nr, Some(t))
+    }
+
     fn dir_menu(&self, ui: &mut Ui, ix: &Index, dir: DirIx, cx: &mut PaneCtx, ev: &mut Vec<Event>) {
         let is_source = ix.dir_parent(dir).is_none();
         let source = &ix.sources()[ix.dir_source(dir) as usize];
+        crate::marks_ui::menu(ui, ix, cx.book, cx.marks, dupemap_core::marks::Place::Dir(dir), None, cx.actions);
+        ui.separator();
         if ui
             .button("Where are the copies?")
             .on_hover_text("Which sources and folders hold copies of these files")
@@ -1034,6 +1137,16 @@ impl TreePane {
     fn file_menu(&self, ui: &mut Ui, ix: &Index, dir: DirIx, f: &FileRow, cx: &mut PaneCtx) {
         let path = ix.path_with_name(dir, &f.name);
         let host = &ix.sources()[ix.dir_source(dir) as usize].host;
+        crate::marks_ui::menu(
+            ui,
+            ix,
+            cx.book,
+            cx.marks,
+            dupemap_core::marks::Place::File(f.file),
+            Some(&f.name),
+            cx.actions,
+        );
+        ui.separator();
         if ui.button("Show every copy").on_hover_text("List every copy in the inspector").clicked() {
             cx.actions.push(Action::Inspect(Some(Target::File { file: f.file, content: f.content })));
             cx.actions.push(Action::OpenInspector);
@@ -1055,6 +1168,13 @@ impl TreePane {
         let n = self.view.rows.len();
         if n == 0 {
             return;
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Delete)) {
+            if let (Some(c), Some(st)) = (self.selected_row(ix), cx.marks) {
+                if let Some((place, name)) = self.row_place(c) {
+                    cx.actions.push(crate::marks_ui::toggle(ix, cx.book, st, place, name.as_deref()));
+                }
+            }
         }
         let (down, up, right, left, enter, home, end, pgdn, pgup, copy) = ui.input_mut(|i| {
             (
@@ -1143,6 +1263,20 @@ impl TreePane {
         match self.view.rows.get(i)?.kind {
             RowKind::Dir { dir, .. } => Some(Sel::Dir(ix.dir_db_id(dir))),
             RowKind::File { dir, index } => self.view.files.get(&dir)?.get(index).map(|f| Sel::File(f.db_id)),
+            RowKind::Loading { .. } => None,
+        }
+    }
+
+    /// The folder or file of a row, with the file's name.
+    fn row_place(&self, i: usize) -> Option<(dupemap_core::marks::Place, Option<String>)> {
+        match self.view.rows.get(i)?.kind {
+            RowKind::Dir { dir, .. } => Some((dupemap_core::marks::Place::Dir(dir), None)),
+            RowKind::File { dir, index } => self
+                .view
+                .files
+                .get(&dir)?
+                .get(index)
+                .map(|f| (dupemap_core::marks::Place::File(f.file), Some(f.name.clone()))),
             RowKind::Loading { .. } => None,
         }
     }
@@ -1394,6 +1528,15 @@ fn reveal_item(ui: &mut Ui, host: &str, path: &str, cx: &mut PaneCtx) {
         cx.actions.push(Action::Reveal(path.to_string()));
         ui.close();
     }
+}
+
+/// A line through a name: marked for deletion.
+fn strike(p: &egui::Painter, r: Rect) {
+    let y = r.center().y + 0.5;
+    p.line_segment(
+        [Pos2::new(r.left(), y), Pos2::new(r.right(), y)],
+        Stroke::new(1.0, colors::alpha(colors::CRITICAL, 0.9)),
+    );
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use crate::groups::{GroupCache, GroupsCtx, GroupsPane};
 use crate::ignore_ui::IgnoreEditor;
 use crate::inspector::Inspector;
 use crate::manifests_ui::{ManifestsWindow, ReportWindow};
+use crate::marks_ui::{ExportWindow, MarkBook, MarksCtx, MarksPane};
 use crate::pane::{PaneCtx, Sel, TreePane};
 use crate::scan_ui::{RemoteScanWindow, ScanCtx, ScanWindow};
 use crate::search_ui::{SearchCtx, SearchPane};
@@ -73,6 +74,7 @@ pub struct Tab {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TabKind {
+    Marks(MarksPane),
     Tree(TreePane),
     Groups(GroupsPane),
     Summary(SummaryPane),
@@ -86,6 +88,7 @@ impl TabKind {
             TabKind::Tree(p) => p.after_load(),
             TabKind::Groups(p) => p.after_load(),
             TabKind::Search(p) => p.after_load(),
+            TabKind::Marks(_) => {}
             TabKind::Summary(_) => {}
         }
     }
@@ -131,6 +134,12 @@ pub struct DupeMapApp {
     cats_version: u64,
     summaries: SummaryCache,
     category_editor: Option<CategoryEditor>,
+    /// Marks for deletion: the rules, and what they mark in the current index.
+    marks: MarkBook,
+    mark_state: Option<Arc<dupemap_core::marks::MarkState>>,
+    /// The (generation, version) `mark_state` was worked out for.
+    mark_state_for: (u64, u64),
+    export: ExportWindow,
     /// Autosave of the session (none when saving is off).
     saver: Option<Saver>,
     session_file: Option<SessionFile>,
@@ -219,6 +228,10 @@ impl DupeMapApp {
             cats_version: 0,
             summaries: SummaryCache::default(),
             category_editor: None,
+            marks: MarkBook::default(),
+            mark_state: None,
+            mark_state_for: (0, 0),
+            export: ExportWindow::default(),
             saver,
             session_file,
             saved_text: String::new(),
@@ -298,7 +311,7 @@ impl DupeMapApp {
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
                 TabKind::Summary(p) => p.root,
-                TabKind::Groups(_) | TabKind::Search(_) => Root::AllSources,
+                TabKind::Groups(_) | TabKind::Search(_) | TabKind::Marks(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources);
         let (surface, node) = match self.focused.and_then(|id| self.dock.find_tab_from(|t| t.id == id)) {
@@ -500,6 +513,29 @@ impl DupeMapApp {
                     self.note("File type categories saved", false);
                 }
                 Reply::Categories(Err(e)) => self.note(format!("Could not save the categories: {e}"), true),
+                Reply::Marks { generation, version, state } => {
+                    if generation == self.generation && version == self.marks.version {
+                        self.mark_state = Some(state);
+                        self.mark_state_for = (generation, version);
+                    }
+                }
+                Reply::MarksNotSaved(e) => self.note(format!("Could not save the marks: {e}"), true),
+                Reply::Exported(r) => {
+                    if let Ok(d) = &r {
+                        let scripts =
+                            d.written.iter().filter(|w| w.what != dupemap_core::export::Written::List).count();
+                        self.note(
+                            format!(
+                                "Wrote {} in {}",
+                                format::plural(scripts as u64, "delete script", "delete scripts"),
+                                d.dir.display()
+                            ),
+                            false,
+                        );
+                    }
+                    self.export.running = false;
+                    self.export.result = Some(r);
+                }
                 Reply::Search { pane, id, generation, result, elapsed_ms } => {
                     for (_, tab) in self.dock.iter_all_tabs_mut() {
                         if tab.id == pane {
@@ -538,6 +574,9 @@ impl DupeMapApp {
             }
             self.index = Some(ix);
             self.restore_inspection();
+            // folder and file numbers changed: work the marks out again
+            self.mark_state = None;
+            self.request_marks();
         }
         if !self.queue.iter().any(|j| matches!(j, Job::SetIgnore(_))) {
             self.ignore_pending = None;
@@ -547,6 +586,13 @@ impl DupeMapApp {
         if let Some(c) = out.categories {
             if *self.categories != c {
                 self.set_categories(c);
+            }
+        }
+        if let Some(m) = out.marks {
+            if !self.marks.loaded {
+                self.marks.load(m);
+                self.mark_state = None;
+                self.request_marks();
             }
         }
         for n in out.notes {
@@ -781,6 +827,38 @@ impl DupeMapApp {
                     self.queue_job(Job::Scan { targets, settings, out_dir });
                 }
                 Action::RestartElevated => self.restart_elevated(),
+                Action::Mark { label, add, remove } => {
+                    if self.marks.loaded && self.marks.apply(label, &add, &remove) {
+                        self.marks_changed();
+                    }
+                }
+                Action::Undo => {
+                    if let Some(l) = self.marks.undo() {
+                        self.note(format!("Undone: {l}"), false);
+                        self.marks_changed();
+                    }
+                }
+                Action::Redo => {
+                    if let Some(l) = self.marks.redo() {
+                        self.note(format!("Redone: {l}"), false);
+                        self.marks_changed();
+                    }
+                }
+                Action::OpenMarks => self.open_marks(),
+                Action::OpenExport => self.export.open(crate::marks_ui::default_export_dir(&self.db_path)),
+                Action::Export(choice) => match (&self.mark_state, self.mark_state_for.0 == self.generation) {
+                    (Some(st), true) => self.worker.send(Query::Export(Box::new(crate::worker::ExportRequest {
+                        generation: self.generation,
+                        state: st.clone(),
+                        sources: choice.sources,
+                        options: choice.options,
+                        dir: choice.dir,
+                    }))),
+                    _ => {
+                        self.export.running = false;
+                        self.note("The marks are still being worked out; try again in a moment", true);
+                    }
+                },
                 Action::CancelJob => {
                     if let Some(j) = &self.job {
                         j.cancel();
@@ -868,6 +946,47 @@ impl DupeMapApp {
         self.focused = Some(id);
     }
 
+    /// Ask the query thread what the marks mark in the current index.
+    fn request_marks(&mut self) {
+        if self.index.is_none() || !self.marks.loaded {
+            return;
+        }
+        self.worker.send(Query::Marks {
+            generation: self.generation,
+            version: self.marks.version,
+            rules: Arc::new(self.marks.rules().to_vec()),
+        });
+    }
+
+    /// The marks changed: work them out and store them.
+    fn marks_changed(&mut self) {
+        self.request_marks();
+        self.worker.send(Query::SaveMarks(Arc::new(self.marks.rules().to_vec())));
+    }
+
+    /// What the marks mark, when it is up to date with the index (it may be one edit behind the
+    /// rules for a moment, which is fine for drawing).
+    fn marks_now(&self) -> Option<&dupemap_core::marks::MarkState> {
+        self.mark_state.as_deref().filter(|_| self.mark_state_for.0 == self.generation)
+    }
+
+    /// Switch to the Marks tab, opening it beside the tree the first time.
+    fn open_marks(&mut self) {
+        let existing = self.dock.iter_all_tabs().find(|(_, t)| matches!(t.kind, TabKind::Marks(_))).map(|(_, t)| t.id);
+        if let Some(id) = existing {
+            self.activate_tab(id);
+            return;
+        }
+        let tab = Tab { id: self.new_tab_id(), kind: TabKind::Marks(MarksPane::default()) };
+        let id = tab.id;
+        if self.dock.iter_all_tabs().count() == 1 {
+            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.5, vec![tab]);
+        } else {
+            self.dock.push_to_focused_leaf(tab);
+        }
+        self.activate_tab(id);
+    }
+
     /// New categories: summaries are recomputed with them.
     fn set_categories(&mut self, c: Categories) {
         self.categories = Arc::new(c);
@@ -911,7 +1030,7 @@ impl DupeMapApp {
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
                 TabKind::Summary(p) => p.root,
-                TabKind::Groups(_) | TabKind::Search(_) => Root::AllSources,
+                TabKind::Groups(_) | TabKind::Search(_) | TabKind::Marks(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources)
     }
@@ -1034,6 +1153,16 @@ impl DupeMapApp {
                     ui.close();
                 }
                 ui.separator();
+                let any_marked = self.marks_now().is_some_and(|m| !m.is_empty());
+                if ui
+                    .add_enabled(any_marked, egui::Button::new("Write delete scripts…"))
+                    .on_hover_text("A script per source to remove the files marked for deletion")
+                    .clicked()
+                {
+                    actions.push(Action::OpenExport);
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Ignored folders…").clicked() {
                     actions.push(Action::OpenIgnoreEditor);
                     ui.close();
@@ -1041,6 +1170,35 @@ impl DupeMapApp {
                 ui.separator();
                 if ui.add(egui::Button::new("Quit").shortcut_text("Ctrl+Q")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                let undo = self.marks.undo_label().map(|l| format!("Undo {l}"));
+                if ui
+                    .add_enabled(
+                        undo.is_some(),
+                        egui::Button::new(undo.as_deref().unwrap_or("Undo")).shortcut_text("Ctrl+Z"),
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Undo);
+                    ui.close();
+                }
+                let redo = self.marks.redo_label().map(|l| format!("Redo {l}"));
+                if ui
+                    .add_enabled(
+                        redo.is_some(),
+                        egui::Button::new(redo.as_deref().unwrap_or("Redo")).shortcut_text("Ctrl+Y"),
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Redo);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Marked for deletion").shortcut_text("Ctrl+M")).clicked() {
+                    actions.push(Action::OpenMarks);
                     ui.close();
                 }
             });
@@ -1157,6 +1315,20 @@ impl DupeMapApp {
                         .stroke(egui::Stroke::new(1.0, colors::CRITICAL));
                     if ui.add(b).on_hover_text("Open the manifest list to read the reports").clicked() {
                         actions.push(Action::OpenManifests);
+                    }
+                }
+                if let Some(m) =
+                    self.mark_state.as_deref().filter(|m| !m.is_empty() && self.mark_state_for.0 == self.generation)
+                {
+                    let mut text = format!("Marked: {}", crate::marks_ui::files_bytes(m.total.files, m.total.bytes));
+                    if m.total.last_files > 0 {
+                        text.push_str(&format!(" · ⚠ {} last copies", format::count(m.total.last_files)));
+                    }
+                    let b = egui::Button::new(RichText::new(text).color(colors::INK))
+                        .fill(colors::alpha(colors::CRITICAL, if m.total.last_files > 0 { 0.35 } else { 0.15 }))
+                        .stroke(egui::Stroke::new(1.0, colors::alpha(colors::CRITICAL, 0.7)));
+                    if ui.add(b).on_hover_text("Files marked for deletion: open the list (Ctrl+M)").clicked() {
+                        actions.push(Action::OpenMarks);
                     }
                 }
                 if let Some(job) = &self.job {
@@ -1312,6 +1484,25 @@ impl DupeMapApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         use egui::{Key, KeyboardShortcut, Modifiers};
+        // undo and redo of marks, unless a text field has the keyboard (it has its own undo)
+        if ctx.memory(|m| m.focused().is_none()) {
+            let (undo, redo) = ctx.input_mut(|i| {
+                (
+                    i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z)),
+                    i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y))
+                        || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)),
+                )
+            });
+            if undo {
+                actions.push(Action::Undo);
+            }
+            if redo {
+                actions.push(Action::Redo);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::M))) {
+            actions.push(Action::OpenMarks);
+        }
         let (open, tab, quit, groups, inspector, summary, find) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
@@ -1384,7 +1575,11 @@ impl eframe::App for DupeMapApp {
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .stroke(egui::Stroke::new(1.0, colors::BASELINE)),
                 )
-                .show(ui, |ui| self.inspector.ui(ui, self.index.as_deref(), &mut actions));
+                .show(ui, |ui| {
+                    let marks =
+                        if self.mark_state_for.0 == self.generation { self.mark_state.as_deref() } else { None };
+                    self.inspector.ui(ui, self.index.as_deref(), &self.marks, marks, &mut actions)
+                });
             self.inspector_width = Some(shown.response.rect.width());
         }
 
@@ -1407,6 +1602,8 @@ impl eframe::App for DupeMapApp {
                         alert_hosts: &self.alert_hosts,
                         linked: self.linked.as_ref(),
                         added: &mut added,
+                        book: &self.marks,
+                        marks: if self.mark_state_for.0 == self.generation { self.mark_state.as_deref() } else { None },
                     };
                     DockArea::new(&mut self.dock)
                         .style(style)
@@ -1438,6 +1635,10 @@ impl eframe::App for DupeMapApp {
         // windows
         let busy = self.busy();
         self.manifests_win.show(&ctx, &self.manifests, &self.db_path, busy, &mut actions);
+        if let Some(ix) = self.index.clone() {
+            let marks = if self.mark_state_for.0 == self.generation { self.mark_state.as_deref() } else { None };
+            self.export.show(&ctx, &ix, marks, Some(frame), &mut actions);
+        }
         self.reports.show(&ctx, &self.manifests, &mut actions);
         if let Some(ed) = &mut self.ignore {
             if !ed.show(&ctx, self.index.as_deref(), busy, &mut actions) {
@@ -1509,6 +1710,8 @@ struct Viewer<'a> {
     alert_hosts: &'a BTreeSet<String>,
     linked: Option<&'a Linked>,
     added: &'a mut Vec<NodePath>,
+    book: &'a MarkBook,
+    marks: Option<&'a dupemap_core::marks::MarkState>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -1539,6 +1742,19 @@ impl TabViewer for Viewer<'_> {
             TabKind::Groups(g) => g.title().into(),
             TabKind::Summary(p) => p.title(Some(self.ix)).into(),
             TabKind::Search(p) => p.title().into(),
+            TabKind::Marks(p) => {
+                let n = self.marks.map(|m| m.total.files).unwrap_or(0);
+                let last = self.marks.is_some_and(|m| m.total.last_files > 0);
+                let title = if n > 0 { format!("{} ({})", p.title(), format::count(n)) } else { p.title() };
+                if last {
+                    let mut job = LayoutJob::default();
+                    job.append("⚠ ", 0.0, TextFormat::simple(FontId::proportional(13.0), colors::CRITICAL));
+                    job.append(&title, 0.0, TextFormat::simple(FontId::proportional(13.5), colors::INK));
+                    job.into()
+                } else {
+                    title.into()
+                }
+            }
         }
     }
 
@@ -1555,6 +1771,8 @@ impl TabViewer for Viewer<'_> {
                     focused: self.focused == Some(tab.id),
                     alert_hosts: self.alert_hosts,
                     linked: self.linked,
+                    book: self.book,
+                    marks: self.marks,
                 };
                 p.ui(ui, &mut cx);
             }
@@ -1568,6 +1786,7 @@ impl TabViewer for Viewer<'_> {
                     pane_id: tab.id,
                     focused: self.focused == Some(tab.id),
                     linked: self.linked,
+                    marks: self.marks,
                 };
                 g.ui(ui, &mut cx);
             }
@@ -1580,6 +1799,19 @@ impl TabViewer for Viewer<'_> {
                     pane_id: tab.id,
                     focused: self.focused == Some(tab.id),
                     linked: self.linked,
+                    book: self.book,
+                    marks: self.marks,
+                };
+                p.ui(ui, &mut cx);
+            }
+            TabKind::Marks(p) => {
+                let mut cx = MarksCtx {
+                    ix: self.ix,
+                    book: self.book,
+                    state: self.marks,
+                    actions: self.actions,
+                    pane_id: tab.id,
+                    focused: self.focused == Some(tab.id),
                 };
                 p.ui(ui, &mut cx);
             }

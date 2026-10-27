@@ -57,6 +57,21 @@ pub enum Action {
     RestartElevated,
     /// Stop the running job (a scan keeps what it hashed).
     CancelJob,
+    /// Change the marks for deletion: add rules (replacing any on the same places), remove
+    /// others. `label` names the change for undo ("mark D:\Backup").
+    Mark {
+        label: String,
+        add: Vec<dupemap_core::marks::MarkRule>,
+        remove: Vec<dupemap_core::marks::PlaceKey>,
+    },
+    Undo,
+    Redo,
+    /// Open (or switch to) the Marks tab.
+    OpenMarks,
+    /// Open the window that writes the delete scripts.
+    OpenExport,
+    /// Write the delete scripts.
+    Export(crate::marks_ui::ExportChoice),
 }
 
 /// Whether a manifest host names this computer ("PC1" or "PC1 D: (Media)" on PC1).

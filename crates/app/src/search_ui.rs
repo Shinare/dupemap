@@ -72,6 +72,9 @@ pub struct SearchCtx<'a> {
     pub pane_id: u64,
     pub focused: bool,
     pub linked: Option<&'a Linked>,
+    /// Marks for deletion: the rules, and what they mark (`None` while worked out).
+    pub book: &'a crate::marks_ui::MarkBook,
+    pub marks: Option<&'a dupemap_core::marks::MarkState>,
 }
 
 #[derive(Clone, Copy)]
@@ -553,7 +556,11 @@ impl SearchPane {
         let icon = Rect::from_min_size(Pos2::new(cols.name.min + PAD, rect.top()), Vec2::new(16.0, ROW_H));
         let (folder, source, size_text, copies) = match h.hit {
             Hit::File(f) => {
-                widgets::file_icon(&p, icon, colors::INK_MUTED);
+                if cx.marks.is_some_and(|m| m.is_marked(f)) {
+                    widgets::trash_icon(&p, icon, colors::CRITICAL);
+                } else {
+                    widgets::file_icon(&p, icon, colors::INK_MUTED);
+                }
                 let size = match ix.size_state(f) {
                     SizeState::Unknown => "?".to_string(),
                     _ => format::bytes(ix.file_size(f)),
@@ -561,13 +568,26 @@ impl SearchPane {
                 (ix.dir_path(ix.file_dir(f)), ix.file_source(f), size, Some(ix.copies(ix.file_content(f))))
             }
             Hit::Dir(d) => {
-                widgets::folder_icon(&p, icon, colors::INK_MUTED);
+                let full = cx.marks.is_some_and(|m| crate::marks_ui::dir_fully_marked(ix, m, d));
+                widgets::folder_icon(&p, icon, if full { colors::CRITICAL } else { colors::INK_MUTED });
                 let parent = ix.dir_parent(d).map(|x| ix.dir_path(x)).unwrap_or_default();
                 (parent, ix.dir_source(d), format::bytes(roll.stats[d as usize].bytes), None)
             }
         };
         let nr = Rect::from_x_y_ranges(Rangef::new(icon.right() + 6.0, cols.name.max - PAD), rect.y_range());
-        widgets::text_left(&p, nr, &h.name, font.clone(), colors::INK);
+        let marked = cx.marks.is_some_and(|m| match h.hit {
+            Hit::File(f) => m.is_marked(f),
+            Hit::Dir(d) => crate::marks_ui::dir_fully_marked(ix, m, d),
+        });
+        let nm =
+            widgets::text_left(&p, nr, &h.name, font.clone(), if marked { colors::INK_SECONDARY } else { colors::INK });
+        if marked {
+            let y = nm.center().y + 0.5;
+            p.line_segment(
+                [Pos2::new(nm.left(), y), Pos2::new(nm.right(), y)],
+                egui::Stroke::new(1.0, colors::alpha(colors::CRITICAL, 0.9)),
+            );
+        }
         if cols.shown[0] {
             let fr = Rect::from_x_y_ranges(Rangef::new(cols.folder.min + PAD, cols.folder.max - PAD), rect.y_range());
             // the end of a long path says more than its start
@@ -639,6 +659,12 @@ impl SearchPane {
             });
         }
         resp.context_menu(|ui| {
+            let (place, name) = match h.hit {
+                Hit::File(f) => (dupemap_core::marks::Place::File(f), Some(h.name.as_str())),
+                Hit::Dir(d) => (dupemap_core::marks::Place::Dir(d), None),
+            };
+            crate::marks_ui::menu(ui, ix, cx.book, cx.marks, place, name, cx.actions);
+            ui.separator();
             if ui.button("Show in a tab").clicked() {
                 cx.actions.push(match h.hit {
                     Hit::File(f) => Action::ShowInTab(f),
@@ -723,6 +749,16 @@ impl SearchPane {
 
     fn keyboard(&mut self, ui: &mut Ui, cx: &mut SearchCtx, r: &SearchResult, select: &mut Option<usize>) {
         use egui::Modifiers as M;
+        if ui.input_mut(|i| i.consume_key(M::NONE, Key::Delete)) {
+            if let (Some(&k), Some(st)) = (self.view.selected.and_then(|c| self.view.order.get(c)), cx.marks) {
+                let h = &r.hits[k as usize];
+                let (place, name) = match h.hit {
+                    Hit::File(f) => (dupemap_core::marks::Place::File(f), Some(h.name.as_str())),
+                    Hit::Dir(d) => (dupemap_core::marks::Place::Dir(d), None),
+                };
+                cx.actions.push(crate::marks_ui::toggle(cx.ix, cx.book, st, place, name));
+            }
+        }
         let (down, up, pgdn, pgup, home, end, enter) = ui.input_mut(|i| {
             (
                 i.consume_key(M::NONE, Key::ArrowDown),

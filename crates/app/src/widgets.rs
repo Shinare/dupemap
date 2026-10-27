@@ -166,6 +166,24 @@ pub fn file_icon(painter: &Painter, rect: Rect, color: Color32) {
     painter.rect_stroke(r, CornerRadius::same(1), Stroke::new(1.0, color), egui::StrokeKind::Inside);
 }
 
+/// A waste bin (lid with a handle, body with ribs): marked for deletion.
+pub fn trash_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let s = Stroke::new(1.2, color);
+    painter.line_segment([Pos2::new(c.x - 5.5, c.y - 3.5), Pos2::new(c.x + 5.5, c.y - 3.5)], s);
+    painter.line_segment([Pos2::new(c.x - 1.5, c.y - 5.5), Pos2::new(c.x + 1.5, c.y - 5.5)], s);
+    let body = vec![
+        Pos2::new(c.x - 4.2, c.y - 2.0),
+        Pos2::new(c.x + 4.2, c.y - 2.0),
+        Pos2::new(c.x + 3.3, c.y + 5.5),
+        Pos2::new(c.x - 3.3, c.y + 5.5),
+    ];
+    painter.add(egui::Shape::closed_line(body, s));
+    let rib = Stroke::new(1.0, color);
+    painter.line_segment([Pos2::new(c.x - 1.3, c.y - 0.3), Pos2::new(c.x - 1.1, c.y + 3.8)], rib);
+    painter.line_segment([Pos2::new(c.x + 1.3, c.y - 0.3), Pos2::new(c.x + 1.1, c.y + 3.8)], rib);
+}
+
 /// A clickable text that looks like a link.
 pub fn link(ui: &mut Ui, text: impl Into<String>) -> Response {
     let text = text.into();

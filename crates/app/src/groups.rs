@@ -142,6 +142,8 @@ pub struct GroupsCtx<'a> {
     pub pane_id: u64,
     pub focused: bool,
     pub linked: Option<&'a Linked>,
+    /// What the marks for deletion mark (`None` while worked out).
+    pub marks: Option<&'a dupemap_core::marks::MarkState>,
 }
 
 #[derive(Clone, Copy)]
@@ -478,8 +480,33 @@ impl GroupsPane {
         let g = &r.group;
         // name
         let icon = Rect::from_min_size(Pos2::new(cols.name.min + PAD, rect.top()), Vec2::new(16.0, ROW_H));
-        widgets::file_icon(&p, icon, colors::INK_MUTED);
+        // copies marked for deletion: the bin, and how many of them
+        let marked = cx.marks.map(|m| m.marked_copies(g.content)).unwrap_or(0);
+        if marked > 0 {
+            widgets::trash_icon(&p, icon, colors::CRITICAL);
+        } else {
+            widgets::file_icon(&p, icon, colors::INK_MUTED);
+        }
         let mut nr = Rect::from_x_y_ranges(Rangef::new(icon.right() + 6.0, cols.name.max - PAD), rect.y_range());
+        if marked > 0 {
+            let (label, stroke) = if marked >= g.copies {
+                ("⚠ all marked".to_string(), colors::CRITICAL)
+            } else {
+                (format!("{marked} of {} marked", g.copies), colors::alpha(colors::CRITICAL, 0.7))
+            };
+            let w = p.layout_no_wrap(label.clone(), small.clone(), colors::INK).size().x + 10.0;
+            if nr.width() > w + 60.0 {
+                widgets::tag(
+                    &p,
+                    Pos2::new(nr.right() - w, rect.center().y),
+                    &label,
+                    small.clone(),
+                    colors::INK,
+                    stroke,
+                );
+                nr.max.x -= w + 6.0;
+            }
+        }
         if g.flagged {
             let label = format!("⚠ {}", cx.ix.content_algo_name(g.content).to_uppercase());
             let w = p.layout_no_wrap(label.clone(), small.clone(), colors::INK).size().x + 10.0;

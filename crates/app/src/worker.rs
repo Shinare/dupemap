@@ -10,11 +10,13 @@
 use crate::selection::Target;
 use dupemap_core::db::{ChecksumImport, ImportAs};
 use dupemap_core::db::{ManifestInfo, Progress as ImportProgress};
+use dupemap_core::export::{ExportOptions, WrittenFile};
 use dupemap_core::ignore::IgnoreSettings;
 use dupemap_core::index::{
     DirIx, DirStats, DupGroup, DupQuery, FileIx, FileRow, Filter, Index, ListOptions, Location, Node, OutsideCopies,
 };
 use dupemap_core::manifest::{find_size_list, first_checksum_paths, guess_checksums, sniff_format, ListFormat};
+use dupemap_core::marks::{resolve, MarkRule, MarkState, MarkTotals, Place};
 use dupemap_core::natsort::natural_cmp;
 use dupemap_core::scan::{scan_volume, ScanProgress, ScanSettings, Volume, VolumeResult};
 use dupemap_core::search::{search, SearchQuery, SearchResult, MAX_HITS};
@@ -72,6 +74,16 @@ pub enum Query {
     },
     /// Store edited categories.
     SetCategories(Categories),
+    /// Work out what the marks for deletion mark (only the newest of several waiting is done).
+    Marks {
+        generation: u64,
+        version: u64,
+        rules: Arc<Vec<MarkRule>>,
+    },
+    /// Store the marks for deletion (only the newest of several waiting is written).
+    SaveMarks(Arc<Vec<MarkRule>>),
+    /// Write delete scripts.
+    Export(Box<ExportRequest>),
     /// Find files and folders by name or hash (answered by the search thread; a newer search
     /// stops an older one).
     Search {
@@ -82,6 +94,29 @@ pub enum Query {
         query: SearchQuery,
     },
 }
+
+/// What to export: the marks as worked out for this index, for some sources.
+pub struct ExportRequest {
+    pub generation: u64,
+    pub state: Arc<MarkState>,
+    pub sources: Vec<dupemap_core::index::SourceIx>,
+    pub options: ExportOptions,
+    pub dir: PathBuf,
+}
+
+/// What an export wrote.
+#[derive(Debug, Clone)]
+pub struct ExportDone {
+    pub dir: PathBuf,
+    pub written: Vec<WrittenFile>,
+    /// Marked files left out because every copy of them is marked.
+    pub left_out: MarkTotals,
+    /// Marked files no script can name (a line break in the name).
+    pub unscriptable: usize,
+}
+
+/// Where each mark (source, path, folder?) is in the index of one generation.
+type PlaceCache = HashMap<(String, String, bool), Option<Place>>;
 
 /// Rows per page of duplicate groups.
 pub const GROUP_PAGE: usize = 200;
@@ -172,6 +207,14 @@ pub enum Reply {
         result: Result<Arc<SearchResult>, String>,
         elapsed_ms: u64,
     },
+    Marks {
+        generation: u64,
+        version: u64,
+        state: Arc<MarkState>,
+    },
+    /// Saving the marks failed.
+    MarksNotSaved(String),
+    Exported(Result<ExportDone, String>),
 }
 
 pub struct Worker {
@@ -192,6 +235,8 @@ impl Worker {
             .name("dupemap-query".into())
             .spawn(move || {
                 let mut state: Option<(u64, Arc<Index>, Db, PathBuf)> = None;
+                // where each mark is, for the index of this generation
+                let mut places: (u64, PlaceCache) = (0, HashMap::new());
                 while let Ok(first) = qrx.recv() {
                     let mut batch = vec![first];
                     batch.extend(qrx.try_iter());
@@ -282,6 +327,54 @@ impl Worker {
                                 repaint();
                             }
                             Query::Search { .. } => {}
+                            Query::Marks { generation, version, rules } => {
+                                let Some((g, ix, db, _)) = &state else { continue };
+                                if *g != generation {
+                                    continue;
+                                }
+                                if places.0 != generation {
+                                    places = (generation, HashMap::new());
+                                }
+                                let key = |r: &MarkRule| (r.host.clone(), r.path.clone(), r.is_dir);
+                                let missing: Vec<MarkRule> =
+                                    rules.iter().filter(|r| !places.1.contains_key(&key(r))).cloned().collect();
+                                if !missing.is_empty() {
+                                    match resolve(ix, db, &missing) {
+                                        Ok(found) => {
+                                            for (r, p) in missing.iter().zip(found) {
+                                                places.1.insert(key(r), p);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            for r in &missing {
+                                                places.1.insert(key(r), None);
+                                            }
+                                        }
+                                    }
+                                }
+                                let at: Vec<Option<Place>> =
+                                    rules.iter().map(|r| places.1.get(&key(r)).copied().flatten()).collect();
+                                let st = Arc::new(MarkState::compute(ix, &rules, &at));
+                                let _ = rtx.send(Reply::Marks { generation, version, state: st });
+                                repaint();
+                            }
+                            Query::SaveMarks(rules) => {
+                                let Some((_, _, db, _)) = &state else { continue };
+                                if let Err(e) = db.set_marks(&rules) {
+                                    let _ = rtx.send(Reply::MarksNotSaved(e.to_string()));
+                                    repaint();
+                                }
+                            }
+                            Query::Export(req) => {
+                                let Some((g, ix, db, _)) = &state else { continue };
+                                let r = if *g != req.generation {
+                                    Err("the data changed meanwhile; try again".to_string())
+                                } else {
+                                    export(ix, db, &req).map_err(|e| e.to_string())
+                                };
+                                let _ = rtx.send(Reply::Exported(r));
+                                repaint();
+                            }
                             Query::SetAlertDismissed { manifest_id, dismissed } => {
                                 let Some((_, _, db, _)) = &state else { continue };
                                 if db.set_alert_dismissed(manifest_id, dismissed).is_ok() {
@@ -384,11 +477,15 @@ fn spawn_search_thread(rtx: Sender<Reply>, repaint: Repaint, latest: Arc<Mutex<H
 /// (inspector, groups, reports), then file listings. Only the newest inspector request counts.
 fn prioritise(batch: Vec<Query>) -> Vec<Query> {
     let last_inspect = batch.iter().rposition(|q| matches!(q, Query::Inspect { .. }));
+    let last_marks = batch.iter().rposition(|q| matches!(q, Query::Marks { .. }));
+    let last_save = batch.iter().rposition(|q| matches!(q, Query::SaveMarks(_)));
     let (mut first, mut second, mut third) = (Vec::new(), Vec::new(), Vec::new());
     for (i, q) in batch.into_iter().enumerate() {
         match q {
             Query::SetIndex { .. } => first.push(q),
             Query::Inspect { .. } if Some(i) != last_inspect => {}
+            Query::Marks { .. } if Some(i) != last_marks => {}
+            Query::SaveMarks(_) if Some(i) != last_save => {}
             Query::Files { .. } => third.push(q),
             _ => second.push(q),
         }
@@ -396,6 +493,22 @@ fn prioritise(batch: Vec<Query>) -> Vec<Query> {
     first.extend(second);
     first.extend(third);
     first
+}
+
+/// Plan and write the delete scripts of an export request.
+fn export(ix: &Index, db: &Db, req: &ExportRequest) -> Result<ExportDone, Error> {
+    let mut plans = dupemap_core::export::plan(ix, db, &req.state, req.options.include_last_copies)?;
+    plans.retain(|p| req.sources.contains(&p.source));
+    let mut left_out = MarkTotals::default();
+    let mut unscriptable = 0;
+    for p in &plans {
+        left_out.files += p.left_out.files;
+        left_out.bytes += p.left_out.bytes;
+        unscriptable += p.unscriptable.len();
+    }
+    let made = dupemap_core::export::utc_text(std::time::SystemTime::now());
+    let written = dupemap_core::export::write(&plans, &req.options, &req.dir, &made)?;
+    Ok(ExportDone { dir: req.dir.clone(), written, left_out, unscriptable })
 }
 
 fn inspect(ix: &Index, db: &Db, target: Target) -> Result<Inspection, Error> {
@@ -521,6 +634,8 @@ pub struct JobOutcome {
     pub manifests: Vec<ManifestInfo>,
     /// The file-type categories stored in the database.
     pub categories: Option<Categories>,
+    /// The marks for deletion stored in the database.
+    pub marks: Option<Vec<MarkRule>>,
     /// Sources of manifests whose alerts were not dismissed.
     pub alert_hosts: BTreeSet<String>,
     pub reports: Vec<ImportReport>,
@@ -690,6 +805,7 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
     out.manifests = db.manifests().unwrap_or_default();
     out.alert_hosts = alert_hosts(&db, &out.manifests);
     out.categories = db.categories().ok();
+    out.marks = db.marks().ok();
     if !changed {
         return out;
     }
