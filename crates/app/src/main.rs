@@ -19,6 +19,7 @@ mod groups;
 mod ignore_ui;
 mod inspector;
 mod manifests_ui;
+mod marks_ui;
 mod pane;
 mod scan_ui;
 mod search_ui;

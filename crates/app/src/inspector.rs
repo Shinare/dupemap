@@ -4,10 +4,12 @@
 use crate::actions::Action;
 use crate::colors;
 use crate::format;
+use crate::marks_ui::MarkBook;
 use crate::selection::Target;
 use crate::widgets;
 use crate::worker::{DirInfo, FileInfo, Inspection, Query, Worker};
 use dupemap_core::index::{Index, Location};
+use dupemap_core::marks::{MarkAction, MarkRule, MarkState};
 use dupemap_core::paths::PathKind;
 use egui::{FontId, Rect, RichText, Sense, Ui, Vec2};
 
@@ -59,7 +61,14 @@ impl Inspector {
         self.info = None;
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, ix: Option<&Index>, actions: &mut Vec<Action>) {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        ix: Option<&Index>,
+        book: &MarkBook,
+        marks: Option<&MarkState>,
+        actions: &mut Vec<Action>,
+    ) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Inspector").strong().color(colors::INK_SECONDARY));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -89,14 +98,21 @@ impl Inspector {
                 widgets::status_label(ui, "⚠", colors::CRITICAL, format!("Could not read the details: {e}"));
             }
             (Some(_), Some(Ok(info))) => match info.as_ref() {
-                Inspection::File(f) => file_ui(ui, ix, f, actions),
-                Inspection::Dir(d) => dir_ui(ui, ix, d, actions),
+                Inspection::File(f) => file_ui(ui, ix, f, book, marks, actions),
+                Inspection::Dir(d) => dir_ui(ui, ix, d, book, marks, actions),
             },
         });
     }
 }
 
-fn file_ui(ui: &mut Ui, ix: &Index, f: &FileInfo, actions: &mut Vec<Action>) {
+fn file_ui(
+    ui: &mut Ui,
+    ix: &Index,
+    f: &FileInfo,
+    book: &MarkBook,
+    marks: Option<&MarkState>,
+    actions: &mut Vec<Action>,
+) {
     ui.add_space(4.0);
     ui.label(RichText::new(&f.name).size(16.0).color(colors::INK));
     let copies = if f.copies <= 1 {
@@ -161,6 +177,22 @@ fn file_ui(ui: &mut Ui, ix: &Index, f: &FileInfo, actions: &mut Vec<Action>) {
     ui.add_space(8.0);
     ui.label(RichText::new("Copies by source").strong());
     ui.label(RichText::new("Every copy is listed; none is treated as the original.").small().color(colors::INK_MUTED));
+    if let Some(m) = marks {
+        let n = f.locations.iter().filter(|l| m.is_marked(l.file)).count();
+        if n > 0 && n == f.locations.len() {
+            widgets::status_label(
+                ui,
+                "⚠",
+                colors::CRITICAL,
+                "Every copy is marked for deletion: deleting them all would lose this file",
+            );
+        } else if n > 0 {
+            ui.label(
+                RichText::new(format!("{} of {} copies marked for deletion", n, f.locations.len()))
+                    .color(colors::CRITICAL),
+            );
+        }
+    }
     ui.add_space(4.0);
     let mut i = 0;
     while i < f.locations.len() {
@@ -169,7 +201,7 @@ fn file_ui(ui: &mut Ui, ix: &Index, f: &FileInfo, actions: &mut Vec<Action>) {
         source_header(ui, ix, s, j - i);
         for (k, l) in f.locations.iter().enumerate().take(j).skip(i) {
             let here = f.on_this_pc.get(k).copied().unwrap_or(false);
-            location_row(ui, l, l.file == f.file, here, actions);
+            location_row(ui, l, l.file == f.file, here, book, marks, actions);
         }
         ui.add_space(6.0);
         i = j;
@@ -196,7 +228,17 @@ fn source_header(ui: &mut Ui, ix: &Index, s: u16, n: usize) {
     );
 }
 
-fn location_row(ui: &mut Ui, l: &Location, selected: bool, on_this_pc: bool, actions: &mut Vec<Action>) {
+#[allow(clippy::too_many_arguments)]
+fn location_row(
+    ui: &mut Ui,
+    l: &Location,
+    selected: bool,
+    on_this_pc: bool,
+    book: &MarkBook,
+    marks: Option<&MarkState>,
+    actions: &mut Vec<Action>,
+) {
+    let marked = marks.is_some_and(|m| m.is_marked(l.file));
     egui::Frame::new()
         .fill(if selected { colors::ROW_SELECTED } else { colors::SURFACE })
         .corner_radius(4)
@@ -210,7 +252,14 @@ fn location_row(ui: &mut Ui, l: &Location, selected: bool, on_this_pc: bool, act
                 // a no-break space: a long path must not leave the marker alone on its line
                 job.append("●\u{a0}", 0.0, egui::TextFormat::simple(font.clone(), colors::ACCENT));
             }
-            job.append(&l.path, 0.0, egui::TextFormat::simple(font, colors::INK));
+            if marked {
+                let mut fmt = egui::TextFormat::simple(font.clone(), colors::INK_SECONDARY);
+                fmt.strikethrough = egui::Stroke::new(1.0, colors::CRITICAL);
+                job.append("🗑\u{a0}", 0.0, egui::TextFormat::simple(font.clone(), colors::CRITICAL));
+                job.append(&l.path, 0.0, fmt);
+            } else {
+                job.append(&l.path, 0.0, egui::TextFormat::simple(font, colors::INK));
+            }
             let resp = ui.add(egui::Label::new(job).wrap());
             if selected {
                 resp.on_hover_text("The selected file");
@@ -225,12 +274,31 @@ fn location_row(ui: &mut Ui, l: &Location, selected: bool, on_this_pc: bool, act
                 if on_this_pc && ui.small_button("Show in Explorer").clicked() {
                     actions.push(Action::Reveal(l.path.clone()));
                 }
+                if marks.is_some() {
+                    let text = if marked { "Unmark" } else { "Mark for deletion" };
+                    let b = egui::Button::new(RichText::new(text).color(if marked {
+                        colors::INK
+                    } else {
+                        colors::CRITICAL
+                    }))
+                    .small();
+                    if ui.add(b).clicked() {
+                        let name = l.path.rsplit(['\\', '/']).next().unwrap_or(&l.path).to_string();
+                        let rule = MarkRule {
+                            host: l.host.clone(),
+                            path: l.path.clone(),
+                            is_dir: false,
+                            action: MarkAction::Delete,
+                        };
+                        actions.push(crate::marks_ui::toggle_rule(book, marked, rule, &name));
+                    }
+                }
             });
         });
     ui.add_space(3.0);
 }
 
-fn dir_ui(ui: &mut Ui, ix: &Index, d: &DirInfo, actions: &mut Vec<Action>) {
+fn dir_ui(ui: &mut Ui, ix: &Index, d: &DirInfo, book: &MarkBook, marks: Option<&MarkState>, actions: &mut Vec<Action>) {
     let is_source = ix.dir_parent(d.dir).is_none();
     let src = &ix.sources()[ix.dir_source(d.dir) as usize];
     ui.add_space(4.0);
@@ -249,6 +317,21 @@ fn dir_ui(ui: &mut Ui, ix: &Index, d: &DirInfo, actions: &mut Vec<Action>) {
                 }
             },
         );
+    }
+    if let Some(m) = marks {
+        let dm = m.dir(d.dir);
+        ui.add_space(4.0);
+        if dm.files > 0 {
+            let mut t =
+                format!("Marked for deletion below: {}", crate::marks_ui::files_bytes(dm.files as u64, dm.bytes));
+            if dm.last_files > 0 {
+                t.push_str(&format!(" · ⚠ {} last copies", format::count(dm.last_files as u64)));
+            }
+            ui.label(RichText::new(t).color(colors::CRITICAL));
+        }
+        ui.horizontal_wrapped(|ui| {
+            crate::marks_ui::menu(ui, ix, book, Some(m), dupemap_core::marks::Place::Dir(d.dir), None, actions);
+        });
     }
     ui.add_space(6.0);
     let st = &d.stats;
