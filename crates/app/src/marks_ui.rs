@@ -372,73 +372,68 @@ impl MarksPane {
                     ui.label(RichText::new("not imported now").color(colors::INK_MUTED));
                 }
             });
-            egui::Grid::new(("mark-rules", host.as_str())).num_columns(4).spacing([12.0, 4.0]).striped(true).show(
-                ui,
-                |ui| {
-                    for i in list {
-                        let r = &rules[i];
-                        // the state may be one edit behind; then the effect is not shown yet
-                        let eff = effects.get(i).filter(|_| effects.len() == rules.len());
-                        let (word, ink) = match r.action {
-                            MarkAction::Delete => ("Delete", colors::CRITICAL),
-                            MarkAction::DeleteDuplicates => ("Delete copies", colors::CRITICAL),
-                            MarkAction::Keep => ("Keep", colors::GOOD),
-                        };
+            for i in list {
+                let r = &rules[i];
+                // the state may be one edit behind; then the effect is not shown yet
+                let eff = effects.get(i).filter(|_| effects.len() == rules.len());
+                let (word, ink) = match r.action {
+                    MarkAction::Delete => ("Delete", colors::CRITICAL),
+                    MarkAction::DeleteDuplicates => ("Delete copies", colors::CRITICAL),
+                    MarkAction::Keep => ("Keep", colors::GOOD),
+                };
+                let (effect, effect_ink, tip) = match eff {
+                    Some(e) if e.place.is_none() => {
+                        ("not found: removed, renamed or ignored".to_string(), colors::INK_MUTED, None)
+                    }
+                    Some(e) if r.action == MarkAction::Keep => {
+                        (format!("keeps {}", format::plural(e.decides, "file", "files")), colors::INK_SECONDARY, None)
+                    }
+                    Some(e) if e.marked.last_files > 0 => (
+                        format!(
+                            "{} · ⚠ {} last copies",
+                            files_bytes(e.marked.files, e.marked.bytes),
+                            format::count(e.marked.last_files)
+                        ),
+                        colors::CRITICAL,
+                        Some("Some of these have no copy left that is not marked"),
+                    ),
+                    Some(e) if e.marked.files > 0 => (
+                        files_bytes(e.marked.files, e.marked.bytes),
+                        colors::INK_SECONDARY,
+                        Some("Every one of them keeps a copy somewhere that is not marked"),
+                    ),
+                    Some(_) => ("marks nothing".to_string(), colors::INK_MUTED, None),
+                    None => ("…".to_string(), colors::INK_MUTED, None),
+                };
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
                         ui.label(RichText::new(word).color(ink)).on_hover_text(r.action.label(r.is_dir));
-                        ui.label(RichText::new(r.display()).color(colors::INK)).on_hover_text(if r.is_dir {
-                            "a folder"
-                        } else {
-                            "a file"
-                        });
-                        match eff {
-                            Some(e) if e.place.is_none() => {
-                                ui.label(
-                                    RichText::new("not found: removed, renamed or ignored").color(colors::INK_MUTED),
-                                );
-                            }
-                            Some(e) if r.action == MarkAction::Keep => {
-                                ui.label(
-                                    RichText::new(format!("keeps {}", format::plural(e.decides, "file", "files")))
-                                        .color(colors::INK_SECONDARY),
-                                );
-                            }
-                            Some(e) => {
-                                let mut t = files_bytes(e.marked.files, e.marked.bytes);
-                                if e.marked.last_files > 0 {
-                                    t.push_str(&format!(" · ⚠ {} last copies", format::count(e.marked.last_files)));
-                                    ui.label(RichText::new(t).color(colors::CRITICAL));
-                                } else if e.marked.files > 0 {
-                                    ui.label(RichText::new(t).color(colors::INK_SECONDARY))
-                                        .on_hover_text("Every one of them keeps a copy somewhere that is not marked");
-                                } else {
-                                    ui.label(RichText::new("marks nothing").color(colors::INK_MUTED));
-                                }
-                            }
-                            None => {
-                                ui.label("…");
-                            }
+                        ui.label(RichText::new(r.display()).color(colors::INK)).on_hover_text(r.display());
+                    },
+                    |ui| {
+                        if ui.small_button("✕").on_hover_text("Remove this mark").clicked() {
+                            cx.actions.push(Action::Mark {
+                                label: format!("remove the mark on {}", r.display()),
+                                add: vec![],
+                                remove: vec![r.place_key()],
+                            });
                         }
-                        ui.horizontal(|ui| {
-                            if let Some(place) = eff.and_then(|e| e.place) {
-                                if ui.small_button("Show").clicked() {
-                                    cx.actions.push(match place {
-                                        Place::Dir(d) => Action::ShowDirInTab(d),
-                                        Place::File(f) => Action::ShowInTab(f),
-                                    });
-                                }
-                            }
-                            if ui.small_button("✕").on_hover_text("Remove this mark").clicked() {
-                                cx.actions.push(Action::Mark {
-                                    label: format!("remove the mark on {}", r.display()),
-                                    add: vec![],
-                                    remove: vec![r.place_key()],
+                        if let Some(place) = eff.and_then(|e| e.place) {
+                            if ui.small_button("Show").clicked() {
+                                cx.actions.push(match place {
+                                    Place::Dir(d) => Action::ShowDirInTab(d),
+                                    Place::File(f) => Action::ShowInTab(f),
                                 });
                             }
-                        });
-                        ui.end_row();
-                    }
-                },
-            );
+                        }
+                        let l = ui.label(RichText::new(effect).color(effect_ink));
+                        if let Some(t) = tip {
+                            l.on_hover_text(t);
+                        }
+                    },
+                );
+            }
         }
     }
 }
@@ -515,17 +510,26 @@ fn last_copies(ui: &mut Ui, ix: &Index, st: &MarkState, actions: &mut Vec<Action
             let mut v: Vec<(DirIx, (u64, u64))> = by_dir.into_iter().collect();
             v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(b.1 .0.cmp(&a.1 .0)));
             const SHOWN: usize = 30;
-            egui::Grid::new("last-copies").num_columns(3).spacing([12.0, 2.0]).show(ui, |ui| {
-                for (d, (n, b)) in v.iter().take(SHOWN) {
-                    let host = &ix.sources()[ix.dir_source(*d) as usize].host;
-                    ui.label(RichText::new(format!("{}  {}", format::host(host), ix.dir_path(*d))).color(colors::INK));
-                    ui.label(RichText::new(files_bytes(*n, *b)).color(colors::INK_SECONDARY));
-                    if ui.small_button("Show").clicked() {
-                        actions.push(Action::ShowDirInTab(*d));
-                    }
-                    ui.end_row();
-                }
-            });
+            ui.add_space(2.0);
+            for (d, (n, b)) in v.iter().take(SHOWN) {
+                let host = &ix.sources()[ix.dir_source(*d) as usize].host;
+                // the numbers and the button stay in view; a long path is cut instead
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        ui.label(
+                            RichText::new(format!("{}  {}", format::host(host), ix.dir_path(*d))).color(colors::INK),
+                        )
+                        .on_hover_text(ix.dir_path(*d));
+                    },
+                    |ui| {
+                        if ui.small_button("Show").clicked() {
+                            actions.push(Action::ShowDirInTab(*d));
+                        }
+                        ui.label(RichText::new(files_bytes(*n, *b)).color(colors::INK_SECONDARY));
+                    },
+                );
+            }
             if v.len() > SHOWN {
                 ui.label(
                     RichText::new(format!("… and {} more folders", v.len() - SHOWN)).small().color(colors::INK_MUTED),
@@ -554,7 +558,6 @@ pub struct ExportWindow {
     pub running: bool,
     pub result: Option<Result<ExportDone, String>>,
 }
-
 
 fn script_kind(kind: PathKind) -> &'static str {
     match kind {

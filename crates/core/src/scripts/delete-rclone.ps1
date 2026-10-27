@@ -38,8 +38,13 @@ $list = @'
 $base = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $logPath = Join-Path $base '@@LOG_NAME@@'
 $utf8 = [System.Text.UTF8Encoding]::new($false)
+$logWriter = $null
 function Log([string]$what, [string]$path) {
-  [System.IO.File]::AppendAllText($logPath, ("{0}`t{1}`t{2}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $what, $path), $utf8)
+  if (-not $script:logWriter) {
+    $script:logWriter = [System.IO.StreamWriter]::new($logPath, $true, $utf8)
+    $script:logWriter.AutoFlush = $true
+  }
+  $script:logWriter.WriteLine(("{0}`t{1}`t{2}" -f [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'), $what, $path))
 }
 function Close-Window {
   if (-not $Yes) { [void](Read-Host 'Press Enter to close') }
@@ -127,6 +132,8 @@ try {
   $flags = @('delete', $remote, '--files-from-raw', $todoFile, '-v', '--log-file', $logPath)
   if ($Permanent) { $flags += @('--drive-use-trash=false', '--onedrive-hard-delete') }
   Log 'rclone' ($flags -join ' ')
+  # rclone writes to the same log: let go of it meanwhile
+  if ($logWriter) { $logWriter.Close(); $script:logWriter = $null }
   & $rclone @flags
   $code = $LASTEXITCODE
   Write-Host ''

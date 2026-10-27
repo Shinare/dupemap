@@ -45,7 +45,9 @@ for a in "$@"; do
 done
 SOURCE=@@HOST_SH@@
 LOG="$(pwd)/@@LOG_NAME@@"
-log() { printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$1" "$2" >> "$LOG"; }
+exec 3>> "$LOG" || { echo "Cannot write the log $LOG: run it in a folder you can write to." >&2; exit 1; }
+# (bash's own clock and an open log: no program started per line)
+log() { local now; printf -v now '%(%F %T)T' -1; printf '%s\t%s\t%s\n' "$now" "$1" "$2" >&3; }
 gb() { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1073741824 }'; }
 
 if [ "$(hostname)" != "$SOURCE" ] && [ "$OTHER" = 0 ]; then
@@ -116,7 +118,7 @@ if [ "$YES" = 0 ]; then
   if [ "$answer" != YES ] && [ "$answer" != yes ]; then echo "Nothing was changed."; exit 0; fi
 fi
 
-STAMP=$(date '+%Y-%m-%d %H%M')
+printf -v STAMP '%(%Y-%m-%d %H%M)T' -1
 done_n=0
 done_bytes=0
 failed=0
