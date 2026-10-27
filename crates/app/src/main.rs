@@ -9,7 +9,9 @@
 mod actions;
 mod app;
 mod categories_ui;
+mod checksum_ui;
 mod colors;
+mod elevate;
 mod files;
 mod fonts;
 mod format;
@@ -18,6 +20,8 @@ mod ignore_ui;
 mod inspector;
 mod manifests_ui;
 mod pane;
+mod scan_ui;
+mod search_ui;
 mod selection;
 mod session;
 mod shot;
@@ -67,6 +71,7 @@ fn parse_args() -> Result<(app::Options, Option<[f32; 2]>, bool), String> {
                 size = Some(parse_size(&v).ok_or(format!("bad window size: {v}"))?);
             }
             "--reset-session" => reset_session = true,
+            "--scan" => opts.open_scan = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -129,7 +134,9 @@ fn main() -> eframe::Result {
             if !e.is_empty() {
                 eprintln!("{e}");
             }
-            eprintln!("usage: DupeMap [--db <path>] [--demo <rows>] [--window <width>x<height>] [--reset-session]");
+            eprintln!(
+                "usage: DupeMap [--db <path>] [--demo <rows>] [--window <width>x<height>] [--reset-session] [--scan]"
+            );
             std::process::exit(if e.is_empty() { 0 } else { 2 });
         }
     };

@@ -344,6 +344,19 @@ impl SummaryPane {
                 .color(colors::INK_SECONDARY),
             );
         });
+        if sum.unknown_size_files > 0 {
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} of unknown size (from checksum lists without sizes) count as 0 bytes",
+                        format::plural(sum.unknown_size_files, "file", "files")
+                    ))
+                    .small()
+                    .color(colors::INK_MUTED),
+                );
+            });
+        }
         if t.files == 0 {
             ui.add_space(8.0);
             ui.label(RichText::new("    Nothing here yet.").color(colors::INK_MUTED));

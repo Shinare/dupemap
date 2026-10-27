@@ -92,10 +92,40 @@ impl Table {
     }
 }
 
+/// Name and hash searches (each reads the whole file table).
+fn search_timings(db: &Db, ix: &Index, t: &mut Table) {
+    use dupemap_core::search::{search, SearchMode, SearchQuery, MAX_HITS};
+    let run = |label: &str, q: SearchQuery, t: &mut Table| {
+        let s = Instant::now();
+        match search(db, ix, &q, MAX_HITS, &|| true) {
+            Ok(r) => {
+                t.ms(&format!("{label}: {} hits{}", r.hits.len(), if r.truncated { "+" } else { "" }), s);
+            }
+            Err(e) => t.add(label, format!("error: {e}")),
+        }
+    };
+    let name = |text: &str| SearchQuery { text: text.into(), ..Default::default() };
+    run("search names, no match", name("no such name anywhere"), t);
+    run("search names, no match (again)", name("nothing like this"), t);
+    run("search names, a word", name("summer"), t);
+    run("search names with Polish letters", name("Świat"), t);
+    run("search names, pattern *.mkv", name("*.mkv"), t);
+    let full: Option<String> = db
+        .conn()
+        .query_row("SELECT hex(digest) FROM file WHERE algo_id = 0 LIMIT 1 OFFSET 1000", [], |r| r.get(0))
+        .ok();
+    if let Some(full) = full {
+        let hash = |text: &str| SearchQuery { text: text.into(), mode: SearchMode::Hash, ..Default::default() };
+        run("search a full SHA-256", hash(&full), t);
+        run("search the first 8 digits of a hash", hash(&full[..8]), t);
+    }
+}
+
 fn main() {
     let mut cfg = Config::default();
     let mut work: Option<PathBuf> = None;
     let mut keep = false;
+    let mut search_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -103,6 +133,8 @@ fn main() {
             "--seed" => cfg.seed = args.next().and_then(|v| v.parse().ok()).unwrap_or(cfg.seed),
             "--work" => work = args.next().map(PathBuf::from),
             "--keep" => keep = true,
+            // time searches on the database a --keep run left in --work
+            "--search-only" => search_only = true,
             _ => {
                 eprintln!("usage: dupemap-bench [--rows N] [--seed S] [--work DIR] [--keep]");
                 std::process::exit(2);
@@ -110,6 +142,19 @@ fn main() {
         }
     }
     let work = work.unwrap_or_else(|| std::env::temp_dir().join(format!("dupemap-bench-{}", cfg.rows)));
+    if search_only {
+        let db = Db::open(&work.join("bench.dupemap")).unwrap();
+        let s = Instant::now();
+        let ix = Index::build(&db).unwrap();
+        let mut t = Table(Vec::new());
+        t.ms(&format!("build index ({} files)", ix.file_count()), s);
+        search_timings(&db, &ix, &mut t);
+        println!("\n| step | result |\n|---|---|");
+        for (k, v) in &t.0 {
+            println!("| {k} | {v} |");
+        }
+        return;
+    }
     let data = work.join("manifests");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&data).unwrap();
@@ -260,6 +305,8 @@ fn main() {
         let _ = ix.summary(Some(big.source), &cats);
         t.ms(&format!("summary by file type, biggest source ({} files)", big.files), s);
     }
+
+    search_timings(&db, &ix, &mut t);
 
     drop(ix);
     drop(db);

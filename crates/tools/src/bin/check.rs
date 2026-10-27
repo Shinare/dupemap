@@ -1,7 +1,10 @@
 //! dupemap-check: import real manifests and print what DupeMap sees, without the GUI.
 //!
-//!   dupemap-check [--db FILE] [--top N] MANIFEST|FOLDER|PATTERN...
+//!   dupemap-check [--db FILE] [--top N] [--source NAME] [--base PREFIX] [--sizes FILE] FILE|FOLDER|PATTERN...
 //!
+//! Checksum lists (`hash  path`, from sha256sum or rclone hashsum) are recognised by their
+//! content; they are imported for the source given with --source (default: guessed from the
+//! file name, e.g. `onedrive-hashsum.txt` → `onedrive:`), relative paths prefixed with --base.
 //! A folder means every `manifest-*.tsv` inside it. Wildcards (`*`, `?`) are expanded here,
 //! because Windows shells pass them through unexpanded.
 //!
@@ -9,7 +12,9 @@
 //! numbers), then a per-source summary and the largest duplicate groups are printed.
 //! With --db the database is kept and re-running with the same manifest file name replaces it.
 
+use dupemap_core::db::{ChecksumImport, ImportAs};
 use dupemap_core::index::{DupQuery, Index};
+use dupemap_core::manifest::{find_size_list, first_checksum_paths, guess_checksums, sniff_format, ListFormat};
 use dupemap_core::{Db, Severity};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -100,14 +105,20 @@ fn expand(arg: &str) -> Vec<PathBuf> {
 fn main() -> ExitCode {
     let mut db_path: Option<PathBuf> = None;
     let mut top = 15usize;
+    let (mut source, mut base, mut sizes): (Option<String>, Option<String>, Option<PathBuf>) = (None, None, None);
     let mut files: Vec<PathBuf> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--db" => db_path = args.next().map(PathBuf::from),
             "--top" => top = args.next().and_then(|v| v.parse().ok()).unwrap_or(top),
+            "--source" => source = args.next(),
+            "--base" => base = args.next(),
+            "--sizes" => sizes = args.next().map(PathBuf::from),
             "-h" | "--help" => {
-                println!("usage: dupemap-check [--db FILE] [--top N] MANIFEST|FOLDER|PATTERN...");
+                println!(
+                    "usage: dupemap-check [--db FILE] [--top N] [--source NAME] [--base PREFIX] [--sizes FILE] FILE|FOLDER|PATTERN..."
+                );
                 return ExitCode::SUCCESS;
             }
             _ => files.extend(expand(&a)),
@@ -138,7 +149,28 @@ fn main() -> ExitCode {
             }
         }
         let t = Instant::now();
-        let report = match db.import_file(f, &mut |_| true) {
+        let format = std::fs::File::open(f).and_then(sniff_format).unwrap_or(ListFormat::Manifest);
+        let how = match format {
+            ListFormat::Manifest => ImportAs::Manifest,
+            ListFormat::Checksums => {
+                let first = std::fs::File::open(f).and_then(|r| first_checksum_paths(r, 20)).unwrap_or_default();
+                let refs: Vec<&[u8]> = first.iter().map(|v| v.as_slice()).collect();
+                let guess = guess_checksums(&name, &refs);
+                let c = ChecksumImport {
+                    host: source.clone().unwrap_or(guess.host),
+                    base: base.clone().unwrap_or(guess.base),
+                    sizes: sizes.clone().or_else(|| find_size_list(f)),
+                };
+                println!(
+                    "{name}: checksum list, imported as source \"{}\"{}{}",
+                    c.host,
+                    if c.base.is_empty() { String::new() } else { format!(", relative paths under {}", c.base) },
+                    c.sizes.as_ref().map(|p| format!(", sizes from {}", p.display())).unwrap_or_default()
+                );
+                ImportAs::Checksums(c)
+            }
+        };
+        let report = match db.import_file_as(f, &how, &mut |_| true) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("{}: import failed: {e}", f.display());

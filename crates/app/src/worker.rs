@@ -2,19 +2,25 @@
 //!
 //! * The **query worker** answers file listings (they need names from SQLite, which takes a
 //!   moment for very large folders) so the UI thread never waits on the database.
-//! * A **job** runs one long operation (open, import, remove, change ignore rules, demo data)
-//!   with progress and cancellation, and ends by building a fresh index.
+//! * The **search thread** runs name and hash searches on a database connection of its own, so
+//!   browsing stays responsive while a search reads the whole file table.
+//! * A **job** runs one long operation (open, import, scan, remove, change ignore rules, demo
+//!   data) with progress and cancellation, and ends by building a fresh index.
 
 use crate::selection::Target;
+use dupemap_core::db::{ChecksumImport, ImportAs};
 use dupemap_core::db::{ManifestInfo, Progress as ImportProgress};
 use dupemap_core::ignore::IgnoreSettings;
 use dupemap_core::index::{
     DirIx, DirStats, DupGroup, DupQuery, FileIx, FileRow, Filter, Index, ListOptions, Location, Node, OutsideCopies,
 };
+use dupemap_core::manifest::{find_size_list, first_checksum_paths, guess_checksums, sniff_format, ListFormat};
 use dupemap_core::natsort::natural_cmp;
+use dupemap_core::scan::{scan_volume, ScanProgress, ScanSettings, Volume, VolumeResult};
+use dupemap_core::search::{search, SearchQuery, SearchResult, MAX_HITS};
 use dupemap_core::summary::{Categories, Summary};
 use dupemap_core::{Db, Error, ImportReport, Severity};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -66,6 +72,15 @@ pub enum Query {
     },
     /// Store edited categories.
     SetCategories(Categories),
+    /// Find files and folders by name or hash (answered by the search thread; a newer search
+    /// stops an older one).
+    Search {
+        /// The tab asking; its newer search stops its older one.
+        pane: u64,
+        id: u64,
+        generation: u64,
+        query: SearchQuery,
+    },
 }
 
 /// Rows per page of duplicate groups.
@@ -77,6 +92,8 @@ pub struct FileInfo {
     pub file: FileIx,
     pub name: String,
     pub size: u64,
+    /// Whether the size was listed, taken from a copy, or is not known.
+    pub size_state: dupemap_core::index::SizeState,
     /// `sha256` or the flagged algorithm.
     pub algo: String,
     /// Lowercase hex for SHA-256, `algo:value` otherwise.
@@ -148,17 +165,29 @@ pub enum Reply {
     },
     /// The categories as stored (cleaned up), or why they could not be.
     Categories(Result<Categories, String>),
+    Search {
+        pane: u64,
+        id: u64,
+        generation: u64,
+        result: Result<Arc<SearchResult>, String>,
+        elapsed_ms: u64,
+    },
 }
 
 pub struct Worker {
     tx: Sender<Query>,
     rx: Receiver<Reply>,
+    search_tx: Sender<Query>,
+    /// The newest search of each tab; an older one still running stops.
+    latest_search: Arc<Mutex<HashMap<u64, u64>>>,
 }
 
 impl Worker {
     pub fn spawn(repaint: Repaint) -> Worker {
         let (qtx, qrx) = channel::<Query>();
         let (rtx, rrx) = channel::<Reply>();
+        let latest_search = Arc::new(Mutex::new(HashMap::new()));
+        let search_tx = spawn_search_thread(rtx.clone(), repaint.clone(), latest_search.clone());
         std::thread::Builder::new()
             .name("dupemap-query".into())
             .spawn(move || {
@@ -252,6 +281,7 @@ impl Worker {
                                 let _ = rtx.send(Reply::Categories(r));
                                 repaint();
                             }
+                            Query::Search { .. } => {}
                             Query::SetAlertDismissed { manifest_id, dismissed } => {
                                 let Some((_, _, db, _)) = &state else { continue };
                                 if db.set_alert_dismissed(manifest_id, dismissed).is_ok() {
@@ -266,16 +296,88 @@ impl Worker {
                 }
             })
             .expect("spawn query thread");
-        Worker { tx: qtx, rx: rrx }
+        Worker { tx: qtx, rx: rrx, search_tx, latest_search }
     }
 
     pub fn send(&self, q: Query) {
-        let _ = self.tx.send(q);
+        match q {
+            Query::Search { pane, id, .. } => {
+                if let Ok(mut l) = self.latest_search.lock() {
+                    l.insert(pane, id);
+                }
+                let _ = self.search_tx.send(q);
+            }
+            Query::SetIndex { generation, ref index, ref db_path } => {
+                let _ =
+                    self.search_tx.send(Query::SetIndex { generation, index: index.clone(), db_path: db_path.clone() });
+                let _ = self.tx.send(q);
+            }
+            q => {
+                let _ = self.tx.send(q);
+            }
+        }
     }
 
     pub fn poll(&self) -> Vec<Reply> {
         self.rx.try_iter().collect()
     }
+}
+
+/// The search thread: its own connection, the newest index, one search at a time (of those
+/// waiting, only each tab's newest runs).
+fn spawn_search_thread(rtx: Sender<Reply>, repaint: Repaint, latest: Arc<Mutex<HashMap<u64, u64>>>) -> Sender<Query> {
+    let (tx, rx) = channel::<Query>();
+    std::thread::Builder::new()
+        .name("dupemap-search".into())
+        .spawn(move || {
+            let mut state: Option<(u64, Arc<Index>, Db, PathBuf)> = None;
+            let is_latest = |pane: u64, id: u64| latest.lock().map(|l| l.get(&pane) == Some(&id)).unwrap_or(false);
+            while let Ok(first) = rx.recv() {
+                let mut batch = vec![first];
+                batch.extend(rx.try_iter());
+                let mut todo: Vec<(u64, u64, u64, SearchQuery)> = Vec::new();
+                for q in batch {
+                    match q {
+                        Query::SetIndex { generation, index, db_path } => {
+                            let reuse = matches!(&state, Some((_, _, _, p)) if *p == db_path);
+                            if reuse {
+                                if let Some(s) = state.as_mut() {
+                                    s.0 = generation;
+                                    s.1 = index;
+                                }
+                            } else {
+                                state = Db::open(&db_path).ok().map(|db| (generation, index, db, db_path));
+                            }
+                        }
+                        Query::Search { pane, id, generation, query } => {
+                            todo.retain(|t| t.0 != pane);
+                            todo.push((pane, id, generation, query));
+                        }
+                        _ => {}
+                    }
+                }
+                for (pane, id, generation, query) in todo {
+                    if !is_latest(pane, id) {
+                        continue;
+                    }
+                    let Some((g, ix, db, _)) = &state else { continue };
+                    if *g != generation {
+                        continue;
+                    }
+                    let t = std::time::Instant::now();
+                    let keep_going = || is_latest(pane, id);
+                    let result = search(db, ix, &query, MAX_HITS, &keep_going).map(Arc::new).map_err(|e| e.to_string());
+                    if !keep_going() {
+                        continue;
+                    }
+                    let elapsed_ms = t.elapsed().as_millis() as u64;
+                    let _ = rtx.send(Reply::Search { pane, id, generation, result, elapsed_ms });
+                    repaint();
+                }
+            }
+        })
+        .expect("spawn search thread");
+    tx
 }
 
 /// Order a batch of queries: index changes first, then what the user is looking at right now
@@ -312,6 +414,7 @@ fn inspect(ix: &Index, db: &Db, target: Target) -> Result<Inspection, Error> {
                 file,
                 name: rec.name,
                 size: ix.file_size(file),
+                size_state: ix.size_state(file),
                 algo: rec.digest.algo_name().to_string(),
                 hash: rec.digest.display(),
                 flagged: !rec.digest.is_sha256(),
@@ -330,12 +433,68 @@ fn inspect(ix: &Index, db: &Db, target: Target) -> Result<Inspection, Error> {
     }
 }
 
+/// A file to import, and how (`None`: a manifest, or a checksum list imported before under
+/// this file name with the same settings; a new checksum list is handed back to ask).
+#[derive(Debug, Clone)]
+pub struct ImportItem {
+    pub path: PathBuf,
+    pub how: Option<ImportAs>,
+}
+
+impl ImportItem {
+    pub fn decide(path: PathBuf) -> ImportItem {
+        ImportItem { path, how: None }
+    }
+}
+
+/// A checksum list that needs its source before it can be imported.
+#[derive(Debug, Clone)]
+pub struct ChecksumAsk {
+    pub path: PathBuf,
+    pub guess: ChecksumImport,
+    /// The first few paths in it.
+    pub sample: Vec<String>,
+}
+
+/// One drive of a scan.
+#[derive(Debug, Clone)]
+pub struct ScanTarget {
+    pub volume: Volume,
+    /// Continue an interrupted scan of it (else start over).
+    pub resume: bool,
+}
+
+/// Where a scan is, for the scan window.
+#[derive(Debug, Clone, Default)]
+pub struct ScanStatus {
+    /// 0-based index of the drive being scanned, and how many there are.
+    pub volume: usize,
+    pub volumes: usize,
+    pub name: String,
+    pub progress: ScanProgress,
+    /// The scanned manifests are being imported.
+    pub importing: bool,
+}
+
+/// The result of one drive's scan.
+#[derive(Debug, Clone)]
+pub struct ScanDone {
+    pub name: String,
+    pub result: Result<VolumeResult, String>,
+}
+
 /// A long operation.
 #[derive(Debug, Clone)]
 pub enum Job {
     /// Open the database and build the index.
     Open,
-    Import(Vec<PathBuf>),
+    Import(Vec<ImportItem>),
+    /// Hash drives of this computer into manifests, then import them.
+    Scan {
+        targets: Vec<ScanTarget>,
+        settings: ScanSettings,
+        out_dir: PathBuf,
+    },
     Remove(Vec<i64>),
     /// Store new ignore rules and rebuild.
     SetIgnore(IgnoreSettings),
@@ -352,6 +511,8 @@ pub struct JobProgress {
     pub step: String,
     /// 0..=1, or negative for "unknown".
     pub fraction: f32,
+    /// Details of a running scan.
+    pub scan: Option<ScanStatus>,
 }
 
 #[derive(Default)]
@@ -366,6 +527,12 @@ pub struct JobOutcome {
     pub notes: Vec<String>,
     pub error: Option<String>,
     pub cancelled: bool,
+    /// Checksum lists that need their source asked before they can be imported.
+    pub ask_checksums: Vec<ChecksumAsk>,
+    /// Per drive, when the job was a scan.
+    pub scan: Vec<ScanDone>,
+    /// The job was a scan.
+    pub was_scan: bool,
 }
 
 pub struct RunningJob {
@@ -396,12 +563,14 @@ pub fn start(db_path: PathBuf, job: Job, repaint: Repaint) -> RunningJob {
     let title = match &job {
         Job::Open => "Opening database",
         Job::Import(_) => "Importing manifests",
+        Job::Scan { .. } => "Scanning this computer",
         Job::Remove(_) => "Removing manifests",
         Job::SetIgnore(_) => "Applying ignore rules",
         Job::Demo { .. } => "Creating demo data",
     }
     .to_string();
-    let progress = Arc::new(Mutex::new(JobProgress { title: title.clone(), step: String::new(), fraction: -1.0 }));
+    let progress =
+        Arc::new(Mutex::new(JobProgress { title: title.clone(), step: String::new(), fraction: -1.0, scan: None }));
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
     let (p2, c2) = (progress.clone(), cancel.clone());
@@ -436,12 +605,39 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
             return out;
         }
     };
+    // whether the index has to be rebuilt (an import of nothing leaves it as it is)
+    let mut changed = true;
     let result: Result<(), Error> = (|| {
         match job {
             Job::Open => {}
-            Job::Import(paths) => {
-                let files = expand_paths(&paths, &mut out.notes);
-                import(&mut db, files, p, cancel, repaint, &mut out)?
+            Job::Import(items) => {
+                let mut ready = Vec::new();
+                for (path, how) in expand_items(items, &mut out.notes) {
+                    match how {
+                        Some(h) => ready.push((path, h)),
+                        // a checksum list: as imported before under this name, else ask
+                        None => match earlier_checksum_settings(&db, &path) {
+                            Some(c) => ready.push((path, ImportAs::Checksums(c))),
+                            None => out.ask_checksums.push(checksum_ask(&path)),
+                        },
+                    }
+                }
+                let n = import(&mut db, ready, p, cancel, repaint, &mut out)?;
+                changed = n > 0;
+            }
+            Job::Scan { targets, settings, out_dir } => {
+                out.was_scan = true;
+                let manifests = scan(&targets, &settings, &out_dir, p, cancel, repaint, &mut out);
+                // what was scanned completely is imported, even after a cancel
+                let keep_going = AtomicBool::new(false);
+                if let Ok(mut g) = p.lock() {
+                    if let Some(s) = g.scan.as_mut() {
+                        s.importing = true;
+                    }
+                }
+                let items = manifests.into_iter().map(|m| (m, ImportAs::Manifest)).collect();
+                let n = import(&mut db, items, p, &keep_going, repaint, &mut out)?;
+                changed = n > 0;
             }
             Job::Remove(ids) => {
                 let names: std::collections::HashMap<i64, String> =
@@ -480,7 +676,8 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
                     .filter(|p| p.extension().is_some_and(|x| x == "tsv"))
                     .collect();
                 paths.sort();
-                import(&mut db, paths, p, cancel, repaint, &mut out)?;
+                let items = paths.into_iter().map(|m| (m, ImportAs::Manifest)).collect();
+                import(&mut db, items, p, cancel, repaint, &mut out)?;
             }
         }
         Ok(())
@@ -493,7 +690,10 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
     out.manifests = db.manifests().unwrap_or_default();
     out.alert_hosts = alert_hosts(&db, &out.manifests);
     out.categories = db.categories().ok();
-    // always end with an index of whatever the database now holds
+    if !changed {
+        return out;
+    }
+    // end with an index of whatever the database now holds
     set(p, "Building index", 0.0, repaint);
     match Index::build_with_progress(&db, &mut |stage, f| set(p, format!("Building index: {stage}"), f, repaint)) {
         Ok(ix) => {
@@ -509,18 +709,20 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
     out
 }
 
+/// Import files; returns how many were imported.
 fn import(
     db: &mut Db,
-    mut paths: Vec<PathBuf>,
+    mut items: Vec<(PathBuf, ImportAs)>,
     p: &Mutex<JobProgress>,
     cancel: &AtomicBool,
     repaint: &Repaint,
     out: &mut JobOutcome,
-) -> Result<(), Error> {
-    paths.sort_by_key(|x| x.file_name().map(|n| n.to_os_string()));
-    paths.dedup();
-    let total = paths.len().max(1);
-    for (i, path) in paths.iter().enumerate() {
+) -> Result<usize, Error> {
+    items.sort_by_key(|(x, _)| x.file_name().map(|n| n.to_os_string()));
+    items.dedup_by(|a, b| a.0 == b.0);
+    let total = items.len().max(1);
+    let mut imported = 0;
+    for (i, (path, how)) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
@@ -529,6 +731,7 @@ fn import(
             set(p, format!("Replacing earlier import of {name}"), i as f32 / total as f32, repaint);
             db.remove_manifest(old.id)?;
             out.notes.push(format!("{name}: replaced the earlier import"));
+            imported += 1;
         }
         let mut last = std::time::Instant::now();
         let mut cb = |pr: ImportProgress| -> bool {
@@ -537,20 +740,150 @@ fn import(
                 let f = if pr.bytes_total > 0 { pr.bytes_done as f32 / pr.bytes_total as f32 } else { 0.0 };
                 set(
                     p,
-                    format!("{name} ({} of {}) · {} rows", i + 1, paths.len(), crate::format::count(pr.rows)),
+                    format!("{name} ({} of {}) · {} rows", i + 1, items.len(), crate::format::count(pr.rows)),
                     (i as f32 + f.min(1.0)) / total as f32,
                     repaint,
                 );
             }
             !cancel.load(Ordering::Relaxed)
         };
-        match db.import_file(path, &mut cb) {
-            Ok(r) => out.reports.push(r),
+        match db.import_file_as(path, how, &mut cb) {
+            Ok(r) => {
+                out.reports.push(r);
+                imported += 1;
+            }
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(e) => out.notes.push(format!("{name}: import failed: {e}")),
         }
     }
-    Ok(())
+    Ok(imported)
+}
+
+/// Decide how each file is imported: given, or (`None` in the result) a checksum list whose
+/// settings still have to be found. Folders become the manifests in them.
+fn expand_items(items: Vec<ImportItem>, notes: &mut Vec<String>) -> Vec<(PathBuf, Option<ImportAs>)> {
+    let mut out = Vec::new();
+    for it in items {
+        if let Some(how) = it.how {
+            out.push((it.path, Some(how)));
+            continue;
+        }
+        for path in expand_paths(std::slice::from_ref(&it.path), notes) {
+            match std::fs::File::open(&path).and_then(sniff_format).unwrap_or(ListFormat::Manifest) {
+                ListFormat::Manifest => out.push((path, Some(ImportAs::Manifest))),
+                ListFormat::Checksums => out.push((path, None)),
+            }
+        }
+    }
+    out
+}
+
+/// A checksum list's settings when it was imported before under the same file name.
+fn earlier_checksum_settings(db: &Db, path: &Path) -> Option<ChecksumImport> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let old = db.manifest_by_name(&name).ok()??;
+    db.report(old.id).ok()?.checksums
+}
+
+/// What to ask about a new checksum list: a guess at its source and a few of its paths.
+pub fn checksum_ask(path: &Path) -> ChecksumAsk {
+    let first = std::fs::File::open(path).and_then(|r| first_checksum_paths(r, 20)).unwrap_or_default();
+    let refs: Vec<&[u8]> = first.iter().map(|v| v.as_slice()).collect();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut guess = guess_checksums(&name, &refs);
+    guess.sizes = find_size_list(path);
+    let sample = first.iter().take(5).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    ChecksumAsk { path: path.to_path_buf(), guess, sample }
+}
+
+/// Scan drives one after the other; returns the manifests that were completed.
+fn scan(
+    targets: &[ScanTarget],
+    settings: &ScanSettings,
+    out_dir: &Path,
+    p: &Mutex<JobProgress>,
+    cancel: &AtomicBool,
+    repaint: &Repaint,
+    out: &mut JobOutcome,
+) -> Vec<PathBuf> {
+    let mut done = Vec::new();
+    let n = targets.len();
+    for (i, t) in targets.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let name = t.volume.display.clone();
+        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut report = |pr: &ScanProgress| {
+            if last.elapsed().as_millis() < 100 && pr.phase != dupemap_core::scan::Phase::Done {
+                return;
+            }
+            last = std::time::Instant::now();
+            let within = if pr.bytes_total > 0 { pr.bytes_done as f32 / pr.bytes_total as f32 } else { 0.0 };
+            let (step, fraction) = match pr.phase {
+                dupemap_core::scan::Phase::Counting => (
+                    format!(
+                        "{name} ({} of {n}): counting · {} files, {}",
+                        i + 1,
+                        crate::format::count(pr.files_total),
+                        crate::format::bytes(pr.bytes_total)
+                    ),
+                    -1.0,
+                ),
+                _ => (
+                    format!(
+                        "{name} ({} of {n}): {} of {} · {}/s",
+                        i + 1,
+                        crate::format::bytes(pr.bytes_done),
+                        crate::format::bytes(pr.bytes_total),
+                        crate::format::bytes(pr.rate() as u64)
+                    ),
+                    (i as f32 + within.min(1.0)) / n as f32,
+                ),
+            };
+            if let Ok(mut g) = p.lock() {
+                g.step = step;
+                g.fraction = fraction;
+                g.scan = Some(ScanStatus {
+                    volume: i,
+                    volumes: n,
+                    name: name.clone(),
+                    progress: pr.clone(),
+                    importing: false,
+                });
+            }
+            repaint();
+        };
+        let r = scan_volume(&t.volume, out_dir, settings, t.resume, &mut report, cancel);
+        match &r {
+            Ok(v) if v.complete => {
+                done.push(v.manifest.clone());
+                let pr = &v.progress;
+                let mut msg = format!(
+                    "Scanned {name}: {} files, {}",
+                    crate::format::count(pr.files_done),
+                    crate::format::bytes(pr.bytes_done)
+                );
+                if pr.failed > 0 {
+                    msg.push_str(&format!(" · {} could not be read", crate::format::count(pr.failed)));
+                }
+                if pr.placeholders_skipped > 0 {
+                    msg.push_str(&format!(
+                        " · {} online-only cloud files skipped",
+                        crate::format::count(pr.placeholders_skipped)
+                    ));
+                }
+                out.notes.push(msg);
+            }
+            Ok(_) => out.notes.push(format!("Scan of {name} stopped; it continues where it stopped next time")),
+            Err(e) => out.notes.push(format!("Could not scan {name}: {e}")),
+        }
+        out.scan.push(ScanDone { name, result: r.map_err(|e| e.to_string()) });
+    }
+    if cancel.load(Ordering::Relaxed) {
+        out.cancelled = true;
+    }
+    done
 }
 
 /// Hosts named in the reports of manifests with an undismissed alert.

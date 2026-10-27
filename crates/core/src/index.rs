@@ -302,6 +302,14 @@ pub struct Index {
     file_size: Vec<u64>,
     file_content: Vec<u32>,
     file_ext: Vec<u32>,
+    /// Files whose size is not known (checksum lists), sorted; their `file_size` is 0.
+    size_unknown: Vec<u32>,
+    /// Files whose size came from a copy with the same hash listed with a size, sorted.
+    size_inferred: Vec<u32>,
+    /// Dense file / folder indices sorted by database id (built on first use: searches,
+    /// restoring a session).
+    files_by_db: std::sync::OnceLock<Vec<u32>>,
+    dirs_by_db: std::sync::OnceLock<Vec<u32>>,
     // contents, numbered in order of first appearance in the tree (cache locality)
     hot: Vec<ContentHot>,
     content_size: Vec<u64>,
@@ -330,6 +338,27 @@ struct ContentHot {
 }
 
 const ROLLUP_CACHE: usize = 6;
+
+/// `file.size` of -1 while loading: not known.
+const UNKNOWN_SIZE: u64 = u64::MAX;
+
+/// How a file's size is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeState {
+    /// Listed with the file.
+    Known,
+    /// Not listed (checksum list), taken from a copy with the same hash that was.
+    FromCopy,
+    /// Not listed and no copy with a size: counted as 0 bytes.
+    Unknown,
+}
+
+/// Positions 0..n sorted by their database id.
+fn sorted_by_db(ids: &[i64]) -> Vec<u32> {
+    let mut v: Vec<u32> = (0..ids.len() as u32).collect();
+    v.sort_unstable_by_key(|&i| ids[i as usize]);
+    v
+}
 
 impl Index {
     /// Build the index from the database, applying the ignore rules stored in it.
@@ -538,7 +567,7 @@ impl Index {
                     if t != NONE && t_hidden_by[t as usize] != u16::MAX {
                         let e = &mut effects[t_hidden_by[t as usize] as usize];
                         e.files += 1;
-                        e.bytes += r.get::<_, i64>(2)? as u64;
+                        e.bytes += r.get::<_, i64>(2)?.max(0) as u64;
                     }
                     continue;
                 }
@@ -551,7 +580,8 @@ impl Index {
                 let idx = r_db.len() as u32;
                 r_db.push(r.get(0)?);
                 r_dir.push(dd);
-                r_size.push(r.get::<_, i64>(2)? as u64);
+                let size: i64 = r.get(2)?;
+                r_size.push(if size < 0 { UNKNOWN_SIZE } else { size as u64 });
                 r_algo.push(algo as u16);
                 r_ext.push(r.get::<_, i64>(5)? as u32);
                 if algo == ALGO_SHA256 && digest.len() == 32 {
@@ -598,9 +628,24 @@ impl Index {
                         r_digest[x].cmp(&r_digest[y]).then(r_size[x].cmp(&r_size[y])).then(a.1.cmp(&b.1))
                     });
                 }
+                // Same digest and size = one content. Files of unknown size sort after the
+                // known sizes of their digest and join that content; with no known size they
+                // form a content of their own.
                 let mut k = 0;
+                let mut known: Option<(u32, usize)> = None;
                 while k < run.len() {
                     let first = run[k].1 as usize;
+                    if r_size[first] == UNKNOWN_SIZE {
+                        if let Some((cid, f0)) = known.filter(|&(_, f0)| r_digest[f0] == r_digest[first]) {
+                            let mut m = k;
+                            while m < run.len() && r_digest[run[m].1 as usize] == r_digest[f0] {
+                                r_content[run[m].1 as usize] = cid;
+                                m += 1;
+                            }
+                            k = m;
+                            continue;
+                        }
+                    }
                     let cid = content_algo.len() as u32;
                     content_algo.push(ALGO_SHA256 as u16);
                     content_size.push(r_size[first]);
@@ -613,22 +658,59 @@ impl Index {
                         r_content[x] = cid;
                         m += 1;
                     }
+                    if r_size[first] != UNKNOWN_SIZE {
+                        known = Some((cid, first));
+                    }
                     k = m;
                 }
                 i = j;
             }
             drop(keys);
+            // flagged hashes: known sizes first, then the unknown ones join a known size
             let mut other_map: HashMap<(u16, Vec<u8>, u64), u32> = HashMap::new();
+            let mut other_known: HashMap<(u16, Vec<u8>), u32> = HashMap::new();
+            other_digest.sort_by_key(|(idx, _)| r_size[*idx as usize] == UNKNOWN_SIZE);
             for (idx, dig) in other_digest.drain(..) {
                 let i = idx as usize;
+                if r_size[i] == UNKNOWN_SIZE {
+                    if let Some(&cid) = other_known.get(&(r_algo[i], dig.clone())) {
+                        r_content[i] = cid;
+                        continue;
+                    }
+                }
                 let key = (r_algo[i], dig, r_size[i]);
-                let cid = *other_map.entry(key).or_insert_with(|| {
+                let cid = *other_map.entry(key.clone()).or_insert_with(|| {
                     let cid = content_algo.len() as u32;
                     content_algo.push(r_algo[i]);
                     content_size.push(r_size[i]);
                     cid
                 });
+                if r_size[i] != UNKNOWN_SIZE {
+                    other_known.entry((key.0, key.1)).or_insert(cid);
+                }
                 r_content[i] = cid;
+            }
+        }
+        // A file of unknown size takes its content's size (inferred) or stays unknown (0 bytes).
+        let mut r_size_state: Vec<u8> = Vec::new();
+        if r_size.contains(&UNKNOWN_SIZE) {
+            r_size_state = vec![0u8; nr];
+            for i in 0..nr {
+                if r_size[i] == UNKNOWN_SIZE {
+                    let c = r_content[i] as usize;
+                    if content_size[c] == UNKNOWN_SIZE {
+                        r_size[i] = 0;
+                        r_size_state[i] = 2;
+                    } else {
+                        r_size[i] = content_size[c];
+                        r_size_state[i] = 1;
+                    }
+                }
+            }
+            for cs in content_size.iter_mut() {
+                if *cs == UNKNOWN_SIZE {
+                    *cs = 0;
+                }
             }
         }
         drop(r_digest);
@@ -658,6 +740,17 @@ impl Index {
         drop(r_dir);
         let file_size: Vec<u64> = perm.iter().map(|&r| r_size[r as usize]).collect();
         drop(r_size);
+        let (mut size_unknown, mut size_inferred) = (Vec::new(), Vec::new());
+        if !r_size_state.is_empty() {
+            for (f, &r) in perm.iter().enumerate() {
+                match r_size_state[r as usize] {
+                    1 => size_inferred.push(f as u32),
+                    2 => size_unknown.push(f as u32),
+                    _ => {}
+                }
+            }
+        }
+        drop(r_size_state);
         let mut file_content: Vec<u32> = perm.iter().map(|&r| r_content[r as usize]).collect();
         drop(r_content);
         // Renumber contents by first appearance in tree order. Backups copy whole folders, so
@@ -784,6 +877,10 @@ impl Index {
             file_size,
             file_content,
             file_ext,
+            size_unknown,
+            size_inferred,
+            files_by_db: std::sync::OnceLock::new(),
+            dirs_by_db: std::sync::OnceLock::new(),
             hot,
             content_size,
             content_file_start,
@@ -900,8 +997,8 @@ impl Index {
 
     /// Dense folder index for a database folder id.
     pub fn dir_by_db_id(&self, db_id: i64) -> Option<DirIx> {
-        // dir_db is not sorted; a linear scan is fine for occasional lookups (session restore)
-        self.dir_db.iter().position(|&x| x == db_id).map(|p| p as DirIx)
+        let by = self.dirs_by_db.get_or_init(|| sorted_by_db(&self.dir_db));
+        by.binary_search_by_key(&db_id, |&d| self.dir_db[d as usize]).ok().map(|p| by[p])
     }
 
     pub fn dir_parent(&self, d: DirIx) -> Option<DirIx> {
@@ -945,9 +1042,33 @@ impl Index {
         self.file_db[f as usize]
     }
 
-    /// Dense file index for a database file id (a linear scan: for restoring a session).
+    /// Dense file index for a database file id (the lookup table is built on first use).
     pub fn file_by_db_id(&self, db_id: i64) -> Option<FileIx> {
-        self.file_db.iter().position(|&x| x == db_id).map(|p| p as FileIx)
+        let by = self.files_by_db.get_or_init(|| sorted_by_db(&self.file_db));
+        by.binary_search_by_key(&db_id, |&f| self.file_db[f as usize]).ok().map(|p| by[p])
+    }
+
+    /// Whether a file's size is known (see [`SizeState`]).
+    pub fn size_state(&self, f: FileIx) -> SizeState {
+        if self.size_unknown.binary_search(&f).is_ok() {
+            SizeState::Unknown
+        } else if self.size_inferred.binary_search(&f).is_ok() {
+            SizeState::FromCopy
+        } else {
+            SizeState::Known
+        }
+    }
+
+    /// Files whose size is not known at all (they count as 0 bytes).
+    pub fn unknown_size_files(&self) -> &[FileIx] {
+        &self.size_unknown
+    }
+
+    /// Is the size of a content's files unknown (it then reads as 0)?
+    pub fn content_size_unknown(&self, c: ContentIx) -> bool {
+        !self.size_unknown.is_empty()
+            && self.content_size[c as usize] == 0
+            && self.content_files(c).iter().all(|&f| self.size_unknown.binary_search(&f).is_ok())
     }
 
     pub fn file_dir(&self, f: FileIx) -> DirIx {
@@ -1779,6 +1900,44 @@ mod tests {
         assert_eq!((s.bytes, s.files, s.dup_files, s.elsewhere_bytes, s.elsewhere_files), (35, 4, 3, 20, 1));
         let s = stats(&ix, &all, "PC1 D: (Data)");
         assert_eq!((s.bytes, s.files), (70, 4));
+    }
+
+    #[test]
+    fn files_without_a_size_take_it_from_a_copy() {
+        let (mut db, _) = fixture();
+        // a checksum list: a.jpg's content (A, 10 bytes on the PC), and a file listed nowhere else
+        let how = crate::db::ImportAs::Checksums(crate::db::ChecksumImport {
+            host: "onedrive:".into(),
+            base: "onedrive:".into(),
+            sizes: None,
+        });
+        let d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let body = format!(
+            "{A}  Pics/a copy.jpg\n{d}  Pics/new.jpg\n{d}  Pics/new again.jpg\n0123456789abcdef0123456789abcdef  Pics/q.bin\n"
+        );
+        db.import_reader_as("od.txt", "od.txt", 0, None, body.as_bytes(), &how, &mut |_| true).unwrap();
+        let ix = Index::build(&db).unwrap();
+        let a = file(&ix, &db, "onedrive:/Pics/a copy.jpg");
+        assert_eq!(ix.size_state(a), SizeState::FromCopy);
+        assert_eq!(ix.file_size(a), 10);
+        assert_eq!(ix.copies(ix.file_content(a)), 3, "two on the PC and this one");
+        let n = file(&ix, &db, "onedrive:/Pics/new.jpg");
+        assert_eq!(ix.size_state(n), SizeState::Unknown);
+        assert_eq!(ix.file_size(n), 0);
+        assert_eq!(ix.copies(ix.file_content(n)), 2, "two unknown-size files with one hash are copies");
+        assert!(ix.content_size_unknown(ix.file_content(n)));
+        assert!(!ix.content_size_unknown(ix.file_content(a)));
+        // a flagged hash also takes the size of a listed copy (q.bin: md5, 5 bytes on the NAS)
+        let q = file(&ix, &db, "onedrive:/Pics/q.bin");
+        assert_eq!((ix.size_state(q), ix.file_size(q)), (SizeState::FromCopy, 5));
+        assert_eq!(ix.unknown_size_files().len(), 2);
+        // a file with a size keeps it
+        let pc = file(&ix, &db, r"D:\Photos\2019\a.jpg");
+        assert_eq!(ix.size_state(pc), SizeState::Known);
+        // folder totals: unknown sizes count as files with 0 bytes
+        let od = dir(&ix, "onedrive:/Pics");
+        let st = ix.rollup(&Filter::default()).stats[od as usize];
+        assert_eq!((st.files, st.bytes), (4, 15));
     }
 
     #[test]

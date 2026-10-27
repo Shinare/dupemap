@@ -211,6 +211,8 @@ pub struct Summary {
     pub exts: Vec<ExtRow>,
     /// Each source's own totals, in source order (only for the all-sources summary).
     pub sources: Vec<(SourceIx, Split)>,
+    /// Files counted with 0 bytes because their size is not known (checksum lists).
+    pub unknown_size_files: u64,
 }
 
 impl Summary {
@@ -218,7 +220,15 @@ impl Summary {
     pub fn empty(cats: &Categories) -> Summary {
         let names = cats.names();
         let categories = vec![Split::default(); names.len()];
-        Summary { scope: None, total: Split::default(), names, categories, exts: Vec::new(), sources: Vec::new() }
+        Summary {
+            scope: None,
+            total: Split::default(),
+            names,
+            categories,
+            exts: Vec::new(),
+            sources: Vec::new(),
+            unknown_size_files: 0,
+        }
     }
 }
 
@@ -235,6 +245,7 @@ impl Index {
             Some(s) => self.subtree_files(self.sources()[s as usize].root),
             None => 0..self.file_count() as FileIx,
         };
+        let unknown_size_files = self.unknown_size_files().iter().filter(|f| files.contains(f)).count() as u64;
         for f in files {
             let status = self.status_of(f);
             let size = self.file_size(f);
@@ -259,7 +270,7 @@ impl Index {
             Some(_) => Vec::new(),
             None => per_source.into_iter().enumerate().map(|(s, sp)| (s as SourceIx, sp)).collect(),
         };
-        Summary { scope, total, names, categories, exts, sources }
+        Summary { scope, total, names, categories, exts, sources, unknown_size_files }
     }
 
     fn status_of(&self, f: FileIx) -> Status {

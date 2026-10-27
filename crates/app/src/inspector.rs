@@ -108,7 +108,28 @@ fn file_ui(ui: &mut Ui, ix: &Index, f: &FileInfo, actions: &mut Vec<Action>) {
             format::count(f.other_sources as u64)
         )
     };
-    ui.label(RichText::new(format!("{} · {copies}", format::bytes(f.size))).color(colors::INK_SECONDARY));
+    let size = match f.size_state {
+        dupemap_core::index::SizeState::Unknown => "size not known".to_string(),
+        _ => format::bytes(f.size),
+    };
+    ui.label(RichText::new(format!("{size} · {copies}")).color(colors::INK_SECONDARY));
+    match f.size_state {
+        dupemap_core::index::SizeState::Unknown => {
+            ui.label(
+                RichText::new("It came from a checksum list without sizes, and no copy with a size is listed.")
+                    .small()
+                    .color(colors::INK_MUTED),
+            );
+        }
+        dupemap_core::index::SizeState::FromCopy => {
+            ui.label(
+                RichText::new("Size taken from a copy with the same hash (its checksum list has no sizes).")
+                    .small()
+                    .color(colors::INK_MUTED),
+            );
+        }
+        dupemap_core::index::SizeState::Known => {}
+    }
     let shown = f.hash.rsplit(':').next().unwrap_or(&f.hash);
     // rows with a button on the right: the text on the left gives way in a narrow panel
     egui::Sides::new().shrink_left().truncate().show(

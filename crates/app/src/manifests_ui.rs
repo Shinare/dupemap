@@ -90,7 +90,7 @@ impl ManifestsWindow {
                 ui.label("Path:");
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.path_input)
-                        .hint_text("a manifest-*.tsv file or a folder of them")
+                        .hint_text("a manifest, a checksum list or a folder of them")
                         .desired_width(420.0),
                 );
                 let go =

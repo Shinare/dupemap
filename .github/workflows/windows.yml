@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --workspace --release 2>&1 | tee "$RUNNER_TEMP/test.log"
+          cargo test --workspace --release --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
 
       - name: Build
         id: build
@@ -67,6 +67,17 @@ jobs:
           # the generated manifests contain deliberate bad lines, so alerts (exit code 1) are expected
           if ($LASTEXITCODE -ne 1) { throw "dupemap-check: expected exit code 1 (alerts), got $LASTEXITCODE" }
           .\target\release\dupemap-check.exe "$env:RUNNER_TEMP\gen\manifest-*.tsv" --top 1 | Select-Object -First 3
+          # the built-in scan: the drives it sees, then a folder hashed into a manifest that imports
+          .\target\release\dupemap-scan.exe --list
+          if ($LASTEXITCODE -ne 0) { throw "dupemap-scan --list failed with $LASTEXITCODE" }
+          $scan = "$env:RUNNER_TEMP\scanme"
+          New-Item -ItemType Directory -Force -Path "$scan\sub dir" | Out-Null
+          [IO.File]::WriteAllBytes("$scan\a.bin", (New-Object byte[] 200000))
+          [IO.File]::WriteAllBytes("$scan\sub dir\copy of a.bin", (New-Object byte[] 200000))
+          .\target\release\dupemap-scan.exe --folder $scan --host "CI test" --out "$env:RUNNER_TEMP\scans" --min-size 1000
+          if ($LASTEXITCODE -ne 0) { throw "dupemap-scan failed with $LASTEXITCODE" }
+          .\target\release\dupemap-check.exe "$env:RUNNER_TEMP\scans" --top 1
+          if ($LASTEXITCODE -ne 0) { throw "the scanned manifest did not import cleanly ($LASTEXITCODE)" }
           .\target\release\dupemap-bench.exe --rows 1000000 --work "$env:RUNNER_TEMP\bench" | Out-File -Encoding utf8 "$env:RUNNER_TEMP\bench.md"
           if ($LASTEXITCODE -ne 0) { throw "dupemap-bench failed with $LASTEXITCODE" }
           Get-Content "$env:RUNNER_TEMP\bench.md"
@@ -125,6 +136,7 @@ jobs:
             target/release/dupemap-gen.exe
             target/release/dupemap-check.exe
             target/release/dupemap-bench.exe
+            target/release/dupemap-scan.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -169,3 +181,22 @@ jobs:
           cat "$S" >> "$GITHUB_STEP_SUMMARY"
           gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file "$S" --edit-last --create-if-none \
             || gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file "$S"
+
+      - name: Publish the logs to a branch
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the job log is not reachable from everywhere; a branch is
+          d="$RUNNER_TEMP/logs-branch"
+          mkdir -p "$d"
+          cp "$RUNNER_TEMP"/*.log "$RUNNER_TEMP"/*.md "$RUNNER_TEMP"/*.txt "$d"/ 2>/dev/null || true
+          cd "$d"
+          git init -q
+          git checkout -q -b logs
+          git add -A
+          git -c user.name="ci" -c user.email="ci@localhost" commit -q -m "logs of ${{ github.sha }}" || exit 0
+          name="${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}"
+          git push -q -f "https://x-access-token:$GH_TOKEN@github.com/${{ github.repository }}.git" "logs:refs/heads/ci-logs/$name"
