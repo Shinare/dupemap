@@ -969,8 +969,11 @@ impl DupeMapApp {
         #[cfg(windows)]
         {
             let mut dialog = rfd::FileDialog::new()
-                .set_title("Import hash manifests")
-                .add_filter("Hash manifests (*.tsv)", &["tsv"])
+                .set_title("Import hash manifests or checksum lists")
+                .add_filter(
+                    "Manifests and checksum lists (*.tsv, *.txt, *.sha256)",
+                    &["tsv", "txt", "sha256", "sha256sum"],
+                )
                 .add_filter("All files", &["*"]);
             if let Some(frame) = frame {
                 dialog = dialog.set_parent(frame);
@@ -978,7 +981,7 @@ impl DupeMapApp {
             let picked = dialog.pick_files();
             if let Some(files) = picked {
                 if !files.is_empty() {
-                    self.queue_job(Job::Import(files));
+                    self.queue_job(Job::Import(files.into_iter().map(ImportItem::decide).collect()));
                 }
             }
         }
