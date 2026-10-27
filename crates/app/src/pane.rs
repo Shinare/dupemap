@@ -453,71 +453,7 @@ impl TreePane {
     /// The filter button: a popup to choose which files this tab shows. Folder totals are then
     /// computed over the matching files only (copies are always counted over everything).
     fn filter_button(&mut self, ui: &mut Ui, ix: &Index, cx: &mut PaneCtx, ev: &mut Vec<Event>, narrow: bool) {
-        let f = &self.opts.filter;
-        let active = !f.is_all();
-        // a narrow pane shows only that a filter is on (the button is filled); the hover says which
-        let label = if active && !narrow { format!("Filter: {}", filter_summary(ix, f)) } else { "Filter".to_string() };
-        let mut button = egui::Button::new(egui::RichText::new(label).color(colors::INK)).truncate();
-        if active {
-            button = button.fill(colors::SELECTION);
-        }
-        let tip = if active {
-            format!("Showing: {}\nClick to change which files this tab shows", filter_summary(ix, f))
-        } else {
-            "Choose which files this tab shows".to_string()
-        };
-        let resp = ui.add(button).on_hover_text(tip);
-        let mut new = f.clone();
-        egui::Popup::from_toggle_button_response(&resp)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .id(ui.id().with(("filter-popup", cx.pane_id)))
-            .show(|ui| {
-                ui.set_min_width(300.0);
-                ui.label(egui::RichText::new("Show files").strong());
-                for (v, text, tip) in [
-                    (CopiesFilter::Any, "All", "Every file"),
-                    (CopiesFilter::Unique, "Unique", "The only copy anywhere"),
-                    (CopiesFilter::Duplicated, "With copies", "Two or more copies anywhere, in any source"),
-                    (
-                        CopiesFilter::InOtherSources,
-                        "With a copy in another source",
-                        "Another machine, drive or cloud account also has it",
-                    ),
-                    (
-                        CopiesFilter::OnlyThisSource,
-                        "With no copy in another source",
-                        "Only its own machine, drive or cloud account has it (perhaps more than once)",
-                    ),
-                ] {
-                    ui.radio_value(&mut new.copies, v, text).on_hover_text(tip);
-                }
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Missing from").strong())
-                    .on_hover_text("Only files that have no copy in the chosen source: what that source lacks");
-                ui.radio_value(&mut new.absent_from, None, "Any source (no condition)");
-                for s in ix.sources() {
-                    ui.radio_value(&mut new.absent_from, Some(s.db_id), format!("Not in {}", format::host(&s.host)));
-                }
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Hash").strong());
-                ui.radio_value(&mut new.hash, HashFilter::Any, "Any");
-                ui.radio_value(&mut new.hash, HashFilter::Sha256, "SHA-256 only");
-                ui.radio_value(&mut new.hash, HashFilter::Flagged, "Not SHA-256 (flagged)")
-                    .on_hover_text("Rows whose hash is not SHA-256: they only match rows of the same algorithm");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!new.is_all(), egui::Button::new("Show all files")).clicked() {
-                        new = Filter::default();
-                    }
-                    ui.label(
-                        egui::RichText::new("Folder totals count matching files only").small().color(colors::INK_MUTED),
-                    );
-                });
-            });
-        if active && ui.small_button("✕").on_hover_text("Clear the filter").clicked() {
-            new = Filter::default();
-        }
-        if new != self.opts.filter {
+        if let Some(new) = filter_button(ui, ix, &self.opts.filter, cx.pane_id, narrow) {
             ev.push(Event::Filter(new));
         }
     }
@@ -1065,6 +1001,10 @@ impl TreePane {
             cx.actions.push(Action::OpenInspector);
             ui.close();
         }
+        if ui.button("Show as treemap").on_hover_text("What it holds, as rectangles sized by their bytes").clicked() {
+            cx.actions.push(Action::OpenTreemap(Some(ix.dir_db_id(dir))));
+            ui.close();
+        }
         ui.separator();
         if is_source {
             if ui.button("Summary by file type").on_hover_text("What kinds of files this source holds").clicked() {
@@ -1085,7 +1025,7 @@ impl TreePane {
                 cx.actions.push(Action::CopyText(ix.dir_name(dir).to_string()));
                 ui.close();
             }
-            reveal_item(ui, &source.host, &path, cx);
+            reveal_item(ui, &source.host, &path, cx.actions);
         }
         ui.separator();
         if ui.button("Expand everything below").clicked() {
@@ -1161,7 +1101,7 @@ impl TreePane {
             cx.actions.push(Action::CopyText(f.name.clone()));
             ui.close();
         }
-        reveal_item(ui, host, &path, cx);
+        reveal_item(ui, host, &path, cx.actions);
     }
 
     fn keyboard(&mut self, ui: &mut Ui, ix: &Index, cx: &mut PaneCtx, ev: &mut Vec<Event>) {
@@ -1370,6 +1310,74 @@ impl TreePane {
 
 /// Expand `dir` and the levels below it, a whole level at a time, stopping before a level that
 /// would take the total past `max` (a half-open level is confusing). Returns (levels, capped).
+/// The Filter button with its popup (tree and treemap tabs). Returns a changed filter.
+pub(crate) fn filter_button(ui: &mut Ui, ix: &Index, f: &Filter, pane_id: u64, narrow: bool) -> Option<Filter> {
+    let active = !f.is_all();
+    // a narrow pane shows only that a filter is on (the button is filled); the hover says which
+    let label = if active && !narrow { format!("Filter: {}", filter_summary(ix, f)) } else { "Filter".to_string() };
+    let mut button = egui::Button::new(egui::RichText::new(label).color(colors::INK)).truncate();
+    if active {
+        button = button.fill(colors::SELECTION);
+    }
+    let tip = if active {
+        format!("Showing: {}\nClick to change which files this tab shows", filter_summary(ix, f))
+    } else {
+        "Choose which files this tab shows".to_string()
+    };
+    let resp = ui.add(button).on_hover_text(tip);
+    let mut new = f.clone();
+    egui::Popup::from_toggle_button_response(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .id(ui.id().with(("filter-popup", pane_id)))
+        .show(|ui| {
+            ui.set_min_width(300.0);
+            ui.label(egui::RichText::new("Show files").strong());
+            for (v, text, tip) in [
+                (CopiesFilter::Any, "All", "Every file"),
+                (CopiesFilter::Unique, "Unique", "The only copy anywhere"),
+                (CopiesFilter::Duplicated, "With copies", "Two or more copies anywhere, in any source"),
+                (
+                    CopiesFilter::InOtherSources,
+                    "With a copy in another source",
+                    "Another machine, drive or cloud account also has it",
+                ),
+                (
+                    CopiesFilter::OnlyThisSource,
+                    "With no copy in another source",
+                    "Only its own machine, drive or cloud account has it (perhaps more than once)",
+                ),
+            ] {
+                ui.radio_value(&mut new.copies, v, text).on_hover_text(tip);
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Missing from").strong())
+                .on_hover_text("Only files that have no copy in the chosen source: what that source lacks");
+            ui.radio_value(&mut new.absent_from, None, "Any source (no condition)");
+            for s in ix.sources() {
+                ui.radio_value(&mut new.absent_from, Some(s.db_id), format!("Not in {}", format::host(&s.host)));
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Hash").strong());
+            ui.radio_value(&mut new.hash, HashFilter::Any, "Any");
+            ui.radio_value(&mut new.hash, HashFilter::Sha256, "SHA-256 only");
+            ui.radio_value(&mut new.hash, HashFilter::Flagged, "Not SHA-256 (flagged)")
+                .on_hover_text("Rows whose hash is not SHA-256: they only match rows of the same algorithm");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!new.is_all(), egui::Button::new("Show all files")).clicked() {
+                    new = Filter::default();
+                }
+                ui.label(
+                    egui::RichText::new("Folder totals count matching files only").small().color(colors::INK_MUTED),
+                );
+            });
+        });
+    if active && ui.small_button("✕").on_hover_text("Clear the filter").clicked() {
+        new = Filter::default();
+    }
+    (new != *f).then_some(new)
+}
+
 fn expand_levels(ix: &Index, dir: DirIx, expanded: &mut HashSet<i64>, max: usize) -> (usize, bool) {
     let mut level = vec![dir];
     let mut total = 0;
@@ -1512,7 +1520,7 @@ fn file_tooltip(ui: &mut Ui, ix: &Index, f: &FileRow) {
 }
 
 /// "Reveal in Explorer" for paths on this computer.
-fn reveal_item(ui: &mut Ui, host: &str, path: &str, cx: &mut PaneCtx) {
+pub(crate) fn reveal_item(ui: &mut Ui, host: &str, path: &str, actions: &mut Vec<Action>) {
     if !cfg!(windows) {
         return;
     }
@@ -1525,7 +1533,7 @@ fn reveal_item(ui: &mut Ui, host: &str, path: &str, cx: &mut PaneCtx) {
         resp.on_disabled_hover_text("Not found on this computer (moved or deleted?)")
     };
     if resp.clicked() {
-        cx.actions.push(Action::Reveal(path.to_string()));
+        actions.push(Action::Reveal(path.to_string()));
         ui.close();
     }
 }

@@ -19,6 +19,7 @@ use crate::session::{Saver, Session, SessionOut, WindowState, VERSION};
 use crate::summary_ui::{SummaryCache, SummaryCtx, SummaryPane};
 use crate::theme;
 use crate::tree::Root;
+use crate::treemap_ui::{TreemapCtx, TreemapPane};
 use crate::widgets;
 use crate::worker::{
     self, ImportItem, Inspection, Job, JobOutcome, Query, Repaint, Reply, RunningJob, ScanDone, Worker,
@@ -79,6 +80,7 @@ pub enum TabKind {
     Groups(GroupsPane),
     Summary(SummaryPane),
     Search(SearchPane),
+    Treemap(TreemapPane),
 }
 
 impl TabKind {
@@ -90,6 +92,7 @@ impl TabKind {
             TabKind::Search(p) => p.after_load(),
             TabKind::Marks(_) => {}
             TabKind::Summary(_) => {}
+            TabKind::Treemap(_) => {}
         }
     }
 }
@@ -313,7 +316,7 @@ impl DupeMapApp {
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
                 TabKind::Summary(p) => p.root,
-                TabKind::Groups(_) | TabKind::Search(_) | TabKind::Marks(_) => Root::AllSources,
+                TabKind::Groups(_) | TabKind::Search(_) | TabKind::Marks(_) | TabKind::Treemap(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources);
         let (surface, node) = match self.focused.and_then(|id| self.dock.find_tab_from(|t| t.id == id)) {
@@ -335,7 +338,7 @@ impl DupeMapApp {
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         /// Captures in order: the main view, the duplicate groups, the summary, then one window at
         /// a time.
-        const SHOTS: [&str; 13] = [
+        const SHOTS: [&str; 14] = [
             "",
             "groups",
             "summary",
@@ -349,6 +352,7 @@ impl DupeMapApp {
             "manifests",
             "keys",
             "about",
+            "treemap",
         ];
         ctx.request_repaint();
         let image = ctx.input(|i| {
@@ -366,7 +370,8 @@ impl DupeMapApp {
             && !self.inspector.is_pending()
             && !self.scan_win.is_listing()
             && !(self.marks.loaded && self.mark_state_for != (self.generation, self.marks.version))
-            && !self.dock.iter_all_tabs().any(|(_, t)| matches!(&t.kind, TabKind::Search(p) if p.is_pending()));
+            && !self.dock.iter_all_tabs().any(|(_, t)| matches!(&t.kind, TabKind::Search(p) if p.is_pending()))
+            && !self.dock.iter_all_tabs().any(|(_, t)| matches!(&t.kind, TabKind::Treemap(p) if p.is_pending()));
         let Some(shot) = &mut self.shot else { return };
         if let Some(img) = image {
             let name = SHOTS[(shot.stage as usize).min(SHOTS.len() - 1)];
@@ -431,7 +436,8 @@ impl DupeMapApp {
                 9 => self.reports.open = true,
                 10 => self.manifests_win.open = true,
                 11 => self.keys_open = true,
-                _ => self.about = true,
+                12 => self.about = true,
+                _ => self.process_simple(vec![Action::OpenTreemap(None)]),
             }
         } else if shot.prepared && shot.stage == 1 && !shot.picked && shot.idle_frames >= 3 {
             // select the biggest group: the inspector lists its copies, the tree highlights them
@@ -583,6 +589,15 @@ impl DupeMapApp {
                     }
                     self.export.running = false;
                     self.export.result = Some(r);
+                }
+                Reply::Treemap(view) => {
+                    for (_, tab) in self.dock.iter_all_tabs_mut() {
+                        if tab.id == view.key.pane {
+                            if let TabKind::Treemap(p) = &mut tab.kind {
+                                p.on_view(view.clone());
+                            }
+                        }
+                    }
                 }
                 Reply::Search { pane, id, generation, result, elapsed_ms } => {
                     for (_, tab) in self.dock.iter_all_tabs_mut() {
@@ -857,6 +872,7 @@ impl DupeMapApp {
                 }
                 Action::OpenGroups => self.open_groups(),
                 Action::OpenSummary(root) => self.open_summary(root),
+                Action::OpenTreemap(focus) => self.open_treemap(focus),
                 Action::OpenCategories => {
                     if self.category_editor.is_none() {
                         self.category_editor = Some(CategoryEditor::new(&self.categories));
@@ -1070,6 +1086,30 @@ impl DupeMapApp {
         self.activate_tab(id);
     }
 
+    /// Switch to the treemap tab (showing `focus`, a folder's database id, or every source),
+    /// opening it beside the tree the first time.
+    fn open_treemap(&mut self, focus: Option<i64>) {
+        let existing =
+            self.dock.iter_all_tabs().find(|(_, t)| matches!(t.kind, TabKind::Treemap(_))).map(|(_, t)| t.id);
+        if let Some(id) = existing {
+            for (_, tab) in self.dock.iter_all_tabs_mut() {
+                if let (true, TabKind::Treemap(p)) = (tab.id == id, &mut tab.kind) {
+                    p.set_focus(focus);
+                }
+            }
+            self.activate_tab(id);
+            return;
+        }
+        let tab = Tab { id: self.new_tab_id(), kind: TabKind::Treemap(TreemapPane::new(focus)) };
+        let id = tab.id;
+        if self.dock.iter_all_tabs().count() == 1 {
+            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.5, vec![tab]);
+        } else {
+            self.dock.push_to_focused_leaf(tab);
+        }
+        self.activate_tab(id);
+    }
+
     /// The root of the focused tab (what "Summary" opens on).
     fn focused_root(&self) -> Root {
         self.dock
@@ -1078,7 +1118,7 @@ impl DupeMapApp {
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
                 TabKind::Summary(p) => p.root,
-                TabKind::Groups(_) | TabKind::Search(_) | TabKind::Marks(_) => Root::AllSources,
+                TabKind::Groups(_) | TabKind::Search(_) | TabKind::Marks(_) | TabKind::Treemap(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources)
     }
@@ -1274,6 +1314,14 @@ impl DupeMapApp {
                 }
                 if ui.add(egui::Button::new("Summary by file type").shortcut_text("Ctrl+U")).clicked() {
                     actions.push(Action::OpenSummary(self.focused_root()));
+                    ui.close();
+                }
+                if ui
+                    .button("Treemap")
+                    .on_hover_text("Every source as rectangles sized by their bytes, coloured by where the copies are")
+                    .clicked()
+                {
+                    actions.push(Action::OpenTreemap(None));
                     ui.close();
                 }
                 if ui.button("File type categories…").clicked() {
@@ -1568,7 +1616,7 @@ impl DupeMapApp {
     }
 
     fn keys_window(&mut self, ctx: &egui::Context) {
-        const KEYS: [(&str, &[(&str, &str)]); 3] = [
+        const KEYS: [(&str, &[(&str, &str)]); 4] = [
             (
                 "Anywhere",
                 &[
@@ -1602,6 +1650,14 @@ impl DupeMapApp {
                     ("↑ ↓ PgUp PgDn Home End", "Move"),
                     ("Enter", "Show it in a tab (the first copy of a group)"),
                     ("Del", "Mark or unmark for deletion (search results)"),
+                ],
+            ),
+            (
+                "In the treemap",
+                &[
+                    ("Double-click or Enter", "Zoom into a folder (a file: show it in a tab)"),
+                    ("Backspace", "Up one level"),
+                    ("Del", "Mark or unmark for deletion"),
                 ],
             ),
         ];
@@ -1794,6 +1850,13 @@ impl eframe::App for DupeMapApp {
                         added: &mut added,
                         book: &self.marks,
                         marks: if self.mark_state_for.0 == self.generation { self.mark_state.as_deref() } else { None },
+                        mark_arc: if self.mark_state_for.0 == self.generation {
+                            self.mark_state.as_ref()
+                        } else {
+                            None
+                        },
+                        marks_key: self.mark_state_for,
+                        cats_version: self.cats_version,
                     };
                     DockArea::new(&mut self.dock)
                         .style(style)
@@ -1905,6 +1968,9 @@ struct Viewer<'a> {
     added: &'a mut Vec<NodePath>,
     book: &'a MarkBook,
     marks: Option<&'a dupemap_core::marks::MarkState>,
+    mark_arc: Option<&'a Arc<dupemap_core::marks::MarkState>>,
+    marks_key: (u64, u64),
+    cats_version: u64,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -1935,6 +2001,7 @@ impl TabViewer for Viewer<'_> {
             TabKind::Groups(g) => g.title().into(),
             TabKind::Summary(p) => p.title(Some(self.ix)).into(),
             TabKind::Search(p) => p.title().into(),
+            TabKind::Treemap(p) => p.title(self.ix).into(),
             TabKind::Marks(p) => {
                 let n = self.marks.map(|m| m.total.files).unwrap_or(0);
                 let last = self.marks.is_some_and(|m| m.total.last_files > 0);
@@ -2005,6 +2072,23 @@ impl TabViewer for Viewer<'_> {
                     actions: self.actions,
                     pane_id: tab.id,
                     focused: self.focused == Some(tab.id),
+                };
+                p.ui(ui, &mut cx);
+            }
+            TabKind::Treemap(p) => {
+                let mut cx = TreemapCtx {
+                    ix: self.ix,
+                    generation: self.generation,
+                    worker: self.worker,
+                    actions: self.actions,
+                    pane_id: tab.id,
+                    focused: self.focused == Some(tab.id),
+                    linked: self.linked,
+                    book: self.book,
+                    marks: self.mark_arc,
+                    marks_key: self.marks_key,
+                    categories: self.categories,
+                    cats_version: self.cats_version,
                 };
                 p.ui(ui, &mut cx);
             }

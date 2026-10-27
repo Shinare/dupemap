@@ -53,6 +53,22 @@ const COPIES_RAMP: [Color32; 4] = [rgb(0x9e3601), rgb(0xcb4801), rgb(0xf16224), 
 /// Duplication accent (bars for "% elsewhere"): orange step 450.
 pub const DUP: Color32 = rgb(0xcb4801);
 
+/// Categorical hues in their fixed order, stepped for the dark surface (file types in the
+/// treemap: the first eight categories; the rest share the neutral grey).
+pub const CATEGORY: [Color32; 8] = [
+    rgb(0x3987e5),
+    rgb(0xd95926),
+    rgb(0x199e70),
+    rgb(0xc98500),
+    rgb(0xd55181),
+    rgb(0x008300),
+    rgb(0x9085e9),
+    rgb(0xe66767),
+];
+
+/// Status "serious": marked for deletion (another copy stays). Critical marks the last copy.
+pub const SERIOUS: Color32 = rgb(0xec835a);
+
 const SIZE_LO: f64 = 1_048_576.0; // 1 MB
 const SIZE_HI: f64 = 107_374_182_400.0; // 100 GB
 

@@ -40,6 +40,8 @@ pub enum Action {
     OpenInspector,
     /// Open a summary tab for one source or all of them (or switch to one already open).
     OpenSummary(Root),
+    /// Open (or switch to) the treemap tab, at a folder (database id) or every source.
+    OpenTreemap(Option<i64>),
     /// Open the category editor.
     OpenCategories,
     /// Store new file-type categories.
