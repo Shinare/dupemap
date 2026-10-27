@@ -3,6 +3,8 @@
 //! * [`manifest`] reads and validates TSV manifests (`hash<TAB>size<TAB>host<TAB>path`).
 //! * [`db`] stores them in SQLite (one source per host, a folder tree, file rows).
 //! * [`index`] builds the in-memory duplicate index: copy counts, folder statistics, listings.
+//! * [`scan`] hashes this computer's drives into manifests (what the export scripts do).
+//! * [`scripts`] makes the same scan as a script for other computers (Windows or Linux).
 //! * [`search`] finds files and folders by name, or files by hash.
 //! * [`sessionfile`] is the crash-safe file the app autosaves its session to.
 //! * [`summary`] totals by file type (editable categories of extensions) and by source.
@@ -16,6 +18,8 @@ pub mod manifest;
 pub mod natsort;
 pub mod paths;
 pub mod report;
+pub mod scan;
+pub mod scripts;
 pub mod search;
 pub mod sessionfile;
 pub mod summary;

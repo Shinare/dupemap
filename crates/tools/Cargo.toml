@@ -19,3 +19,7 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "dupemap-check"
 path = "src/bin/check.rs"
+
+[[bin]]
+name = "dupemap-scan"
+path = "src/bin/scan.rs"
