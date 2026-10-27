@@ -9,8 +9,9 @@ use crate::groups::{GroupCache, GroupsCtx, GroupsPane};
 use crate::ignore_ui::IgnoreEditor;
 use crate::inspector::Inspector;
 use crate::manifests_ui::{ManifestsWindow, ReportWindow};
-use crate::pane::{PaneCtx, TreePane};
+use crate::pane::{PaneCtx, Sel, TreePane};
 use crate::selection::{Linked, Target};
+use crate::session::{Saver, Session, SessionOut, WindowState, VERSION};
 use crate::summary_ui::{SummaryCache, SummaryCtx, SummaryPane};
 use crate::theme;
 use crate::tree::Root;
@@ -19,6 +20,7 @@ use crate::worker::{self, Inspection, Job, JobOutcome, Query, Repaint, Reply, Ru
 use dupemap_core::db::ManifestInfo;
 use dupemap_core::ignore::IgnoreSettings;
 use dupemap_core::index::{DirIx, FileIx, Index};
+use dupemap_core::sessionfile::SessionFile;
 use dupemap_core::summary::Categories;
 use dupemap_core::Severity;
 use egui::text::{LayoutJob, TextFormat};
@@ -30,9 +32,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Command-line options.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     pub db_path: PathBuf,
+    /// The session read from the session file at startup (see `session.rs`).
+    pub session: Option<Session>,
+    /// Where to autosave the session; `None` switches saving off (screenshots).
+    pub session_file: Option<SessionFile>,
     /// Generate and import synthetic manifests of about this many rows.
     pub demo_rows: Option<u64>,
     /// Save screenshots here once loaded, then exit (CI).
@@ -63,6 +69,17 @@ pub enum TabKind {
     Tree(TreePane),
     Groups(GroupsPane),
     Summary(SummaryPane),
+}
+
+impl TabKind {
+    /// The tab was read from a saved session.
+    pub fn after_load(&mut self) {
+        match self {
+            TabKind::Tree(p) => p.after_load(),
+            TabKind::Groups(p) => p.after_load(),
+            TabKind::Summary(_) => {}
+        }
+    }
 }
 
 struct Note {
@@ -105,6 +122,16 @@ pub struct DupeMapApp {
     cats_version: u64,
     summaries: SummaryCache,
     category_editor: Option<CategoryEditor>,
+    /// Autosave of the session (none when saving is off).
+    saver: Option<Saver>,
+    /// The text last handed to the saver.
+    saved_text: String,
+    last_save_check: f64,
+    save_failed_noted: bool,
+    window: Option<WindowState>,
+    inspector_width: Option<f32>,
+    /// The inspected item of the saved session, selected once the index is there.
+    restore_inspected: Option<Sel>,
 }
 
 const STATUS_SECS: f64 = 12.0;
@@ -127,6 +154,18 @@ impl DupeMapApp {
             None => queue.push_back(Job::Open),
         }
         let first = Tab { id: 1, kind: TabKind::Tree(TreePane::new(Root::AllSources)) };
+        let (dock, next_tab_id, focused, inspector) = match opts.session {
+            Some(s) => {
+                let next = s.next_tab_id();
+                let focused = s.focused.or_else(|| s.dock.iter_all_tabs().next().map(|(_, t)| t.id));
+                let mut inspector = Inspector::default();
+                inspector.open = s.inspector_open;
+                (s.dock, next, focused, (inspector, s.inspector_width, s.inspected, s.window))
+            }
+            None => (DockState::new(vec![first]), 2, Some(1), (Inspector::default(), None, None, None)),
+        };
+        let (inspector, inspector_width, restore_inspected, window) = inspector;
+        let saver = opts.session_file.map(Saver::spawn);
         DupeMapApp {
             ctx: ctx.clone(),
             db_path: opts.db_path,
@@ -140,9 +179,9 @@ impl DupeMapApp {
             job: None,
             queue,
             ignore_pending: None,
-            dock: DockState::new(vec![first]),
-            next_tab_id: 2,
-            focused: Some(1),
+            dock,
+            next_tab_id,
+            focused,
             manifests_win: ManifestsWindow::default(),
             reports: ReportWindow::default(),
             ignore: None,
@@ -154,13 +193,20 @@ impl DupeMapApp {
                 ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 1.0e9);
                 Shot { path, stage: 0, prepared: false, picked: false, idle_frames: 0, requested: false }
             }),
-            inspector: Inspector::default(),
+            inspector,
             linked: None,
             groups: GroupCache::default(),
             categories: Arc::new(Categories::default()),
             cats_version: 0,
             summaries: SummaryCache::default(),
             category_editor: None,
+            saver,
+            saved_text: String::new(),
+            last_save_check: 0.0,
+            save_failed_noted: false,
+            window,
+            inspector_width,
+            restore_inspected,
         }
     }
 
@@ -438,6 +484,7 @@ impl DupeMapApp {
                 ed.rebase(ix.ignore_settings());
             }
             self.index = Some(ix);
+            self.restore_inspection();
         }
         if !self.queue.iter().any(|j| matches!(j, Job::SetIgnore(_))) {
             self.ignore_pending = None;
@@ -472,6 +519,118 @@ impl DupeMapApp {
             self.note(msg, false);
             self.reports.show_reports(out.reports);
         }
+    }
+
+    // ------------------------------------------------------------------ session
+
+    /// Select again what the saved session had selected, as soon as there is an index to find it
+    /// in. Items that no longer exist are dropped.
+    fn restore_inspection(&mut self) {
+        let (Some(sel), Some(ix)) = (self.restore_inspected.take(), self.index.clone()) else { return };
+        let target = match sel {
+            Sel::Dir(id) => ix.dir_by_db_id(id).map(Target::Dir),
+            Sel::File(id) => ix.file_by_db_id(id).map(|file| Target::File { file, content: ix.file_content(file) }),
+        };
+        if target.is_some() {
+            self.inspect(target);
+        }
+    }
+
+    /// The inspected item as a database id (survives index rebuilds).
+    fn inspected_sel(&self) -> Option<Sel> {
+        let Some(ix) = &self.index else { return self.restore_inspected };
+        match self.inspector.target()? {
+            Target::Dir(d) => Some(Sel::Dir(ix.dir_db_id(d))),
+            Target::File { file, .. } => Some(Sel::File(ix.file_db_id(file))),
+        }
+    }
+
+    /// Remember where the window is (not while maximised or minimised: the normal rectangle is
+    /// the one to come back to).
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let w = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.outer_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false), v.fullscreen)
+        });
+        let (inner, outer, maximized, minimized, fullscreen) = w;
+        if minimized {
+            return;
+        }
+        let prev = self.window;
+        let mut now = prev.unwrap_or(WindowState { size: [1440.0, 900.0], pos: None, maximized: false });
+        now.maximized = maximized;
+        if !maximized && fullscreen != Some(true) {
+            if let Some(r) = inner {
+                now.size = [r.width(), r.height()];
+            }
+            if let Some(r) = outer {
+                now.pos = Some([r.min.x, r.min.y]);
+            }
+        }
+        if let Some(w) = now.sane() {
+            self.window = Some(w);
+        }
+    }
+
+    fn session_text(&self) -> Option<String> {
+        serde_json::to_string(&SessionOut {
+            version: VERSION,
+            dock: &self.dock,
+            focused: self.focused,
+            inspector_open: self.inspector.open,
+            inspector_width: self.inspector_width,
+            inspected: self.inspected_sel(),
+            window: self.window,
+        })
+        .ok()
+    }
+
+    /// Hand the session to the saver when it changed (checked about once a second).
+    fn autosave(&mut self, ctx: &egui::Context) {
+        if self.saver.is_none() {
+            return;
+        }
+        self.track_window(ctx);
+        let now = ctx.input(|i| i.time);
+        if now - self.last_save_check < 1.0 {
+            // a change right now is picked up a moment later even if nothing else happens
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            return;
+        }
+        self.last_save_check = now;
+        if let Some(text) = self.session_text() {
+            if text != self.saved_text {
+                if let Some(s) = &self.saver {
+                    s.submit(text.clone());
+                }
+                self.saved_text = text;
+            }
+        }
+        let failed = self.saver.as_ref().is_some_and(|s| s.failed());
+        if failed && !self.save_failed_noted {
+            self.save_failed_noted = true;
+            self.note("Could not save the session (tabs and layout) next to the database", true);
+        } else if !failed {
+            self.save_failed_noted = false;
+        }
+    }
+
+    /// Final save on exit: waits for the file to be written.
+    fn save_on_exit(&mut self) {
+        if let Some(text) = self.session_text() {
+            if let Some(s) = &mut self.saver {
+                s.submit(text);
+                s.finish();
+            }
+        }
+    }
+
+    /// View → Reset layout: one tab with every source.
+    fn reset_layout(&mut self) {
+        let tab = self.make_tab(Root::AllSources);
+        self.focused = Some(tab.id);
+        self.dock = DockState::new(vec![tab]);
+        self.inspect(None);
     }
 
     // ------------------------------------------------------------------ actions
@@ -774,6 +933,14 @@ impl DupeMapApp {
                     actions.push(Action::ToggleInspector);
                     ui.close();
                 }
+                if ui
+                    .button("Reset layout")
+                    .on_hover_text("Close every tab and start with one tab of all sources")
+                    .clicked()
+                {
+                    self.reset_layout();
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Messages…").clicked() {
                     self.log_open = true;
@@ -1021,6 +1188,10 @@ impl eframe::App for DupeMapApp {
         self.poll(ctx);
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_on_exit();
+    }
+
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut actions = Vec::new();
@@ -1038,7 +1209,8 @@ impl eframe::App for DupeMapApp {
         if self.inspector.open && has_data {
             // about a quarter of a small window, at most 400 px; resizable
             let default = (ui.available_width() * 0.28).clamp(260.0, 400.0);
-            egui::Panel::right("inspector")
+            let default = self.inspector_width.map(|w| w.clamp(240.0, 760.0)).unwrap_or(default);
+            let shown = egui::Panel::right("inspector")
                 .resizable(true)
                 .default_size(default)
                 .size_range(240.0..=760.0)
@@ -1049,6 +1221,7 @@ impl eframe::App for DupeMapApp {
                         .stroke(egui::Stroke::new(1.0, colors::BASELINE)),
                 )
                 .show(ui, |ui| self.inspector.ui(ui, self.index.as_deref(), &mut actions));
+            self.inspector_width = Some(shown.response.rect.width());
         }
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
@@ -1124,6 +1297,7 @@ impl eframe::App for DupeMapApp {
         }
         self.drop_overlay(&ctx);
         self.process(Some(frame), actions);
+        self.autosave(&ctx);
         if self.shot.is_some() {
             self.screenshot_step(&ctx);
         }

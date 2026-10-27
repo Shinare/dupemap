@@ -68,6 +68,9 @@ pub struct TreePane {
     pub expanded: HashSet<i64>,
     pub selected: Option<Sel>,
     pub widths: Widths,
+    /// Scroll position (pixels), kept for the saved session.
+    #[serde(default)]
+    pub scroll: f32,
     #[serde(skip)]
     view: View,
 }
@@ -83,6 +86,9 @@ struct View {
     scroll_to: Option<f32>,
     /// A row to bring into view once it is listed (after a reveal); frames left to wait for it.
     pending_reveal: Option<(Sel, u16)>,
+    /// A scroll position from the saved session, applied once the listing is complete (offset,
+    /// frames left to wait).
+    restore: Option<(f32, u16)>,
     /// Depth of the deepest listed row (sets the indentation in narrow panes).
     max_depth: u16,
 }
@@ -137,7 +143,27 @@ impl TreePane {
             expanded: HashSet::new(),
             selected: None,
             widths: Widths::default(),
+            scroll: 0.0,
             view: View::default(),
+        }
+    }
+
+    /// This pane was read from a saved session: scroll back to where it was once the rows are
+    /// listed.
+    pub fn after_load(&mut self) {
+        if self.scroll > 0.0 {
+            self.view.restore = Some((self.scroll, 600));
+        }
+    }
+
+    /// Scroll to the saved position when the folder listings it depends on have arrived.
+    fn apply_restore(&mut self, files_pending: bool) {
+        let Some((off, left)) = self.view.restore else { return };
+        if !files_pending || left == 0 {
+            self.view.scroll_to = Some(off);
+            self.view.restore = None;
+        } else {
+            self.view.restore = Some((off, left - 1));
         }
     }
 
@@ -251,6 +277,7 @@ impl TreePane {
         }
         self.refresh(&ix, cx.files, cx.worker, cx.generation);
         self.scroll_to_pending_reveal(&ix, cx.files.is_pending());
+        self.apply_restore(cx.files.is_pending());
         let mut ev = Vec::new();
         self.toolbar(ui, &ix, cx, &mut ev);
         ui.add_space(4.0);
@@ -585,6 +612,9 @@ impl TreePane {
         });
         self.view.offset = out.state.offset.y;
         self.view.viewport_h = out.inner_rect.height();
+        if self.view.restore.is_none() {
+            self.scroll = self.view.offset;
+        }
     }
 
     fn header(&mut self, ui: &mut Ui, rect: Rect, cols: Cols, pane_id: u64, ev: &mut Vec<Event>) {
