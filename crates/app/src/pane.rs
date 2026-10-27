@@ -901,7 +901,12 @@ impl TreePane {
                     }
                 }
                 widgets::text_left(&p, nr, &f.name, font.clone(), ink);
-                size_cell(&p, cols.size, rect, f.size, row.parent_bytes, unique);
+                if ix.size_state(f.file) == dupemap_core::index::SizeState::Unknown {
+                    // a checksum list without sizes, and no copy with one
+                    widgets::text_right(&p, inner(cols.size, rect), "?", FontId::proportional(13.0), colors::INK_MUTED);
+                } else {
+                    size_cell(&p, cols.size, rect, f.size, row.parent_bytes, unique);
+                }
                 if cols.shown[2] {
                     widgets::pill(
                         &p,

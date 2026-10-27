@@ -92,6 +92,8 @@ pub struct FileInfo {
     pub file: FileIx,
     pub name: String,
     pub size: u64,
+    /// Whether the size was listed, taken from a copy, or is not known.
+    pub size_state: dupemap_core::index::SizeState,
     /// `sha256` or the flagged algorithm.
     pub algo: String,
     /// Lowercase hex for SHA-256, `algo:value` otherwise.
@@ -412,6 +414,7 @@ fn inspect(ix: &Index, db: &Db, target: Target) -> Result<Inspection, Error> {
                 file,
                 name: rec.name,
                 size: ix.file_size(file),
+                size_state: ix.size_state(file),
                 algo: rec.digest.algo_name().to_string(),
                 hash: rec.digest.display(),
                 flagged: !rec.digest.is_sha256(),

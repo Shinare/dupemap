@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --workspace --release 2>&1 | tee "$RUNNER_TEMP/test.log"
+          cargo test --workspace --release --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/test.log"
 
       - name: Build
         id: build

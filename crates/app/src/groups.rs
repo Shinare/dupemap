@@ -498,7 +498,7 @@ impl GroupsPane {
         widgets::text_left(&p, nr, &r.name, font.clone(), colors::INK);
         // size of each copy
         if cols.shown[0] {
-            let each = format::bytes(g.size);
+            let each = if cx.ix.content_size_unknown(g.content) { "?".to_string() } else { format::bytes(g.size) };
             widgets::text_right(&p, inner(cols.size, rect), &each, font.clone(), colors::INK_SECONDARY);
         }
         // copies

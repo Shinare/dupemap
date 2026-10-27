@@ -33,6 +33,8 @@ pub struct ScanWindow {
     settings: ScanSettings,
     start_over: bool,
     show_failures: bool,
+    /// What the start button scans (worked out while drawing the list).
+    targets: Vec<ScanTarget>,
 }
 
 impl Default for ScanWindow {
@@ -46,6 +48,7 @@ impl Default for ScanWindow {
             settings: ScanSettings::default(),
             start_over: false,
             show_failures: false,
+            targets: Vec::new(),
         }
     }
 }
@@ -99,18 +102,26 @@ impl ScanWindow {
             .collapsible(false)
             .resizable(true)
             .default_width(640.0)
-            .default_height(560.0)
+            .default_height(600.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| self.body(ui, ctx, cx));
+                if let Some(st) = cx.running {
+                    self.progress(ui, st, cx);
+                    return;
+                }
+                // the start button stays in view below the list
+                let footer = 64.0;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height((ui.available_height() - footer).max(160.0))
+                    .show(ui, |ui| self.body(ui, ctx, cx));
+                ui.separator();
+                self.footer(ui, cx);
             });
         self.open = open;
     }
 
     fn body(&mut self, ui: &mut Ui, ctx: &egui::Context, cx: &mut ScanCtx) {
-        if let Some(st) = cx.running {
-            self.progress(ui, st, cx);
-            return;
-        }
+        self.targets.clear();
         let volumes = self.volumes.lock().ok().and_then(|v| v.clone());
         if volumes.is_some() {
             self.listing = false;
@@ -263,7 +274,19 @@ impl ScanWindow {
             );
             ui.checkbox(&mut self.start_over, "Start interrupted scans over instead of continuing them");
         });
-        ui.add_space(8.0);
+        self.targets = volumes
+            .iter()
+            .filter(|v| self.chosen.contains(&v.root))
+            .map(|v| ScanTarget { volume: v.clone(), resume: !self.start_over })
+            .collect();
+        if !cx.last.is_empty() {
+            ui.add_space(10.0);
+            ui.separator();
+            self.last_results(ui, cx.last);
+        }
+    }
+
+    fn footer(&mut self, ui: &mut Ui, cx: &mut ScanCtx) {
         ui.label(
             RichText::new(format!(
                 "Manifests are saved in {} and imported as each drive is done.",
@@ -272,34 +295,25 @@ impl ScanWindow {
             .small()
             .color(colors::INK_MUTED),
         );
-        ui.add_space(4.0);
-        let targets: Vec<ScanTarget> = volumes
-            .iter()
-            .filter(|v| self.chosen.contains(&v.root))
-            .map(|v| ScanTarget { volume: v.clone(), resume: !self.start_over })
-            .collect();
         ui.horizontal(|ui| {
-            let label = match targets.len() {
+            let label = match self.targets.len() {
                 0 => "Start scan".to_string(),
                 1 => "Scan 1 drive".to_string(),
                 n => format!("Scan {n} drives"),
             };
             if ui
-                .add_enabled(!targets.is_empty() && !cx.busy, egui::Button::new(RichText::new(label).strong()))
+                .add_enabled(!self.targets.is_empty() && !cx.busy, egui::Button::new(RichText::new(label).strong()))
                 .clicked()
             {
-                cx.actions.push(Action::StartScan(targets.clone(), self.settings.clone()));
+                cx.actions.push(Action::StartScan(self.targets.clone(), self.settings.clone()));
                 self.show_failures = false;
             }
             if cx.busy {
                 ui.label(RichText::new("Waiting for the current task to finish").color(colors::INK_MUTED));
+            } else if self.targets.is_empty() {
+                ui.label(RichText::new("Tick the drives to scan").color(colors::INK_MUTED));
             }
         });
-        if !cx.last.is_empty() {
-            ui.add_space(10.0);
-            ui.separator();
-            self.last_results(ui, cx.last);
-        }
     }
 
     fn progress(&mut self, ui: &mut Ui, st: &ScanStatus, cx: &mut ScanCtx) {

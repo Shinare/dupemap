@@ -112,14 +112,16 @@ impl Volume {
     }
 }
 
-/// `manifest-<text>` with characters Windows does not allow in file names replaced.
+/// `manifest-<text>`: spaces and slashes become dashes, characters Windows does not allow in
+/// file names are dropped (`DESKTOP C` → `manifest-DESKTOP-C`, `nas /mnt/tank` →
+/// `manifest-nas-mnt-tank`).
 pub fn manifest_stem(text: &str) -> String {
     let mut s = String::from("manifest-");
     let mut last_dash = true;
     for c in text.trim().chars() {
         let c = match c {
-            '<' | '>' | ':' | '"' | '|' | '?' | '*' => continue,
-            '/' | '\\' => '-',
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '(' | ')' => continue,
+            '/' | '\\' | ' ' => '-',
             c if c.is_control() => '_',
             c => c,
         };
@@ -312,7 +314,7 @@ pub fn scan_volume(
         for _ in 0..threads {
             let tx = res_tx.clone();
             let (rx, cur, hashed) = (&job_rx, &current, &hashed);
-            scope.spawn(move || hasher(rx, tx, cur, hashed, sequential));
+            scope.spawn(move || hasher(rx, tx, cur, hashed, sequential, cancel));
         }
         drop(res_tx);
         let (walker, done, stats) = (&walker, &done, &walk_stats);
@@ -321,8 +323,22 @@ pub fn scan_volume(
             walker.walk(cancel, &mut |entry| {
                 match entry {
                     WalkItem::File { path, key, .. } => {
-                        if !done.contains(&key) && job_tx.send(path).is_err() {
-                            return false;
+                        if !done.contains(&key) {
+                            // never block on a full queue once a stop was asked for
+                            let mut item = path;
+                            loop {
+                                match job_tx.try_send(item) {
+                                    Ok(()) => break,
+                                    Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                                        if cancel.load(Ordering::Relaxed) {
+                                            return false;
+                                        }
+                                        item = back;
+                                        std::thread::sleep(Duration::from_millis(5));
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+                                }
+                            }
                         }
                     }
                     WalkItem::Placeholder => placeholders += 1,
@@ -425,24 +441,30 @@ fn hasher(
     current: &Mutex<String>,
     hashed: &AtomicU64,
     sequential: bool,
+    cancel: &AtomicBool,
 ) {
     let mut buf = vec![0u8; if sequential { 4 << 20 } else { 1 << 20 }];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let job = match rx.lock() {
-            Ok(r) => r.recv(),
+            Ok(r) => r.recv_timeout(Duration::from_millis(200)),
             Err(_) => return,
         };
-        let Ok(path) = job else { return };
+        let path = match job {
+            Ok(p) => p,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         if let Ok(mut c) = current.lock() {
             *c = path.display().to_string();
         }
-        let before = hashed.load(Ordering::Relaxed);
-        let outcome = match hash_file(&path, &mut buf, hashed) {
+        let outcome = match hash_file(&path, &mut buf, hashed, cancel) {
             Ok((hash, size)) => HashOutcome::Done { path, size, hash },
-            Err(e) => {
-                let _ = before;
-                HashOutcome::Failed { path, error: e.to_string() }
-            }
+            // stopped in the middle of a file: it is not written, the next scan does it
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return,
+            Err(e) => HashOutcome::Failed { path, error: e.to_string() },
         };
         if tx.send(outcome).is_err() {
             return;
@@ -450,12 +472,21 @@ fn hasher(
     }
 }
 
-/// SHA-256 (lower-case hex) and the number of bytes read.
-pub fn hash_file(path: &Path, buf: &mut [u8], counter: &AtomicU64) -> std::io::Result<(String, u64)> {
+/// SHA-256 (lower-case hex) and the number of bytes read. Stops with an `Interrupted` error
+/// when `cancel` is set (checked between reads, so a big file does not hold up a stop).
+pub fn hash_file(
+    path: &Path,
+    buf: &mut [u8],
+    counter: &AtomicU64,
+    cancel: &AtomicBool,
+) -> std::io::Result<(String, u64)> {
     let mut f = platform::open_sequential(path)?;
     let mut h = Sha256::new();
     let mut n = 0u64;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped"));
+        }
         let r = match f.read(buf) {
             Ok(0) => break,
             Ok(r) => r,
@@ -1290,7 +1321,8 @@ mod tests {
     fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         let mut made = Vec::new();
         let mut put = |rel: &str, data: Vec<u8>| {
-            let p = root.join(rel);
+            // separators of this system, as the scan writes them
+            let p = rel.split('/').fold(root.to_path_buf(), |p, c| p.join(c));
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(&p, &data).unwrap();
             made.push((p, data));
@@ -1411,10 +1443,24 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_interrupts_a_file_being_hashed() {
+        let root = tmp("stop");
+        fs::write(root.join("big.bin"), vec![5u8; 3 << 20]).unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        let counter = AtomicU64::new(0);
+        let e = hash_file(&root.join("big.bin"), &mut buf, &counter, &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::Interrupted);
+        let (h, n) = hash_file(&root.join("big.bin"), &mut buf, &counter, &AtomicBool::new(false)).unwrap();
+        assert_eq!((h, n), (sha(&vec![5u8; 3 << 20]), 3 << 20));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn manifest_names() {
-        assert_eq!(manifest_stem("DESKTOP-1 C"), "manifest-DESKTOP-1 C");
-        assert_eq!(manifest_stem("nas /mnt/tank/media"), "manifest-nas -mnt-tank-media");
-        assert_eq!(manifest_stem("pc <x>:|?* /"), "manifest-pc x");
+        assert_eq!(manifest_stem("DESKTOP-1 C"), "manifest-DESKTOP-1-C");
+        assert_eq!(manifest_stem("nas /mnt/tank/media"), "manifest-nas-mnt-tank-media");
+        assert_eq!(manifest_stem("pc <x>:|?* /"), "manifest-pc-x");
+        assert_eq!(manifest_stem("vm /"), "manifest-vm");
     }
 
     #[test]
