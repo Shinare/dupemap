@@ -214,28 +214,41 @@ impl SearchPane {
         let now = ui.input(|i| i.time);
         let before = self.draft.clone();
         let mut enter = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(4.0);
-            let hint = match self.draft.mode {
+        // the field and the "by" choice on one row, where to look on the next unless all fits
+        let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect()).width();
+        let spacing = ui.spacing().item_spacing.x;
+        let field_w = (avail - 90.0 - 3.0 * spacing - 16.0).clamp(140.0, 340.0);
+        let one_row = avail >= field_w + 90.0 + 150.0 + 130.0 + 4.0 * spacing + 16.0;
+        let mut field = |ui: &mut Ui, this: &mut SearchPane| {
+            let hint = match this.draft.mode {
                 SearchMode::Name => "Name or part of it; *.mkv, IMG_20??.jpg",
                 SearchMode::Hash => "SHA-256, or its first digits",
             };
-            let w = (ui.available_width() - 12.0).clamp(160.0, 340.0);
-            let edit = ui.add(egui::TextEdit::singleline(&mut self.draft.text).hint_text(hint).desired_width(w));
-            if std::mem::take(&mut self.view.focus_field) {
+            let edit = ui.add(egui::TextEdit::singleline(&mut this.draft.text).hint_text(hint).desired_width(field_w));
+            if std::mem::take(&mut this.view.focus_field) {
                 edit.request_focus();
+                // everything selected, so typing replaces the last search
+                let mut st = egui::TextEdit::load_state(ui.ctx(), edit.id).unwrap_or_default();
+                let n = this.draft.text.chars().count();
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(n),
+                )));
+                st.store(ui.ctx(), edit.id);
             }
             enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            let mode_text = match self.draft.mode {
+            let mode_text = match this.draft.mode {
                 SearchMode::Name => "By name",
                 SearchMode::Hash => "By hash",
             };
             egui::ComboBox::from_id_salt(("s-mode", pane)).selected_text(mode_text).width(90.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.draft.mode, SearchMode::Name, "By name");
-                ui.selectable_value(&mut self.draft.mode, SearchMode::Hash, "By hash")
+                ui.selectable_value(&mut this.draft.mode, SearchMode::Name, "By name");
+                ui.selectable_value(&mut this.draft.mode, SearchMode::Hash, "By hash")
                     .on_hover_text("Every file with this hash: paste a whole SHA-256 or type its first digits");
             });
-            let scope_text = match self.draft.scope.and_then(|id| ix.source_ix(id)) {
+        };
+        let scope = |ui: &mut Ui, this: &mut SearchPane| {
+            let scope_text = match this.draft.scope.and_then(|id| ix.source_ix(id)) {
                 Some(s) => format::host(&ix.sources()[s as usize].host).to_string(),
                 None => "All sources".into(),
             };
@@ -245,13 +258,13 @@ impl SearchPane {
                 .height(420.0)
                 .truncate()
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.draft.scope, None, "All sources");
+                    ui.selectable_value(&mut this.draft.scope, None, "All sources");
                     for s in ix.sources() {
-                        ui.selectable_value(&mut self.draft.scope, Some(s.db_id), format::host(&s.host));
+                        ui.selectable_value(&mut this.draft.scope, Some(s.db_id), format::host(&s.host));
                     }
                 });
-            if self.draft.mode == SearchMode::Name {
-                let what_text = match self.draft.what {
+            if this.draft.mode == SearchMode::Name {
+                let what_text = match this.draft.what {
                     SearchWhat::FilesAndFolders => "Files and folders",
                     SearchWhat::Files => "Files",
                     SearchWhat::Folders => "Folders",
@@ -259,13 +272,29 @@ impl SearchPane {
                 egui::ComboBox::from_id_salt(("s-what", pane)).selected_text(what_text).width(130.0).show_ui(
                     ui,
                     |ui| {
-                        ui.selectable_value(&mut self.draft.what, SearchWhat::FilesAndFolders, "Files and folders");
-                        ui.selectable_value(&mut self.draft.what, SearchWhat::Files, "Files");
-                        ui.selectable_value(&mut self.draft.what, SearchWhat::Folders, "Folders");
+                        ui.selectable_value(&mut this.draft.what, SearchWhat::FilesAndFolders, "Files and folders");
+                        ui.selectable_value(&mut this.draft.what, SearchWhat::Files, "Files");
+                        ui.selectable_value(&mut this.draft.what, SearchWhat::Folders, "Folders");
                     },
                 );
             }
-        });
+        };
+        if one_row {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                field(ui, self);
+                scope(ui, self);
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                field(ui, self);
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                scope(ui, self);
+            });
+        }
         // a pasted hash switches to a hash search
         if self.draft.text != before.text && self.draft.mode == SearchMode::Name && looks_like_sha256(&self.draft.text)
         {
@@ -418,7 +447,7 @@ impl SearchPane {
         let copies_w = if shown[1] { 70.0 } else { 0.0 };
         let source_w = if shown[2] { (width * 0.14).clamp(MIN[2], 180.0) } else { 0.0 };
         let rest = (width - size_w - copies_w - source_w).max(0.0);
-        let (name_w, folder_w) = if shown[0] { (rest * 0.42, rest * 0.58) } else { (rest, 0.0) };
+        let (name_w, folder_w) = if shown[0] { (rest * 0.55, rest * 0.45) } else { (rest, 0.0) };
         let n1 = left + name_w;
         let f1 = n1 + folder_w;
         let s1 = f1 + source_w;

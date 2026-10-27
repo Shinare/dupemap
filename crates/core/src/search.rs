@@ -1,9 +1,10 @@
 //! Finding files and folders by name, or files by hash, across every source.
 //!
 //! Names live in SQLite, so a search is one pass over the `file` (and `dir`) table with a `LIKE`
-//! filter: about half a second for 5 million rows. `LIKE` ignores case for ASCII letters only, so
-//! a search with other letters (`ł`, `Ś`, `é`...) compares through a Unicode lower-casing
-//! function instead. Results are capped at [`MAX_HITS`].
+//! filter: well under a second for 5 million rows. Case and accents do not matter: `plaza` finds
+//! `Plaża.jpg` and `ŚWIAT` finds `świat`. `LIKE` itself ignores case for ASCII only, so names with
+//! other letters are compared through a folding function (lower case, accents removed); names
+//! that are plain ASCII skip it. Results are capped at [`MAX_HITS`].
 
 use crate::db::Db;
 use crate::error::{err, Result};
@@ -67,10 +68,8 @@ pub struct SearchResult {
 /// What a name search looks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamePattern {
-    /// `LIKE` pattern (escape character `\`).
+    /// `LIKE` pattern (escape character `\`), folded (lower case, no accents).
     like: String,
-    /// Compare lower-cased names (the pattern has letters `LIKE` cannot fold).
-    fold: bool,
 }
 
 impl NamePattern {
@@ -80,8 +79,7 @@ impl NamePattern {
         if t.is_empty() {
             return err("Type part of a name, or a pattern such as *.mkv");
         }
-        let fold = !t.is_ascii();
-        let t = if fold { fold_case(t) } else { t.to_string() };
+        let t = fold_text(t);
         let glob = t.contains('*') || t.contains('?');
         let mut like = String::with_capacity(t.len() + 2);
         if !glob {
@@ -101,21 +99,55 @@ impl NamePattern {
         if !glob {
             like.push('%');
         }
-        Ok(NamePattern { like, fold })
+        Ok(NamePattern { like })
     }
 
+    /// Plain ASCII names are compared directly (`LIKE` folds ASCII case); names with any other
+    /// character go through the folding function.
     fn condition(&self, column: &str) -> String {
-        if self.fold {
-            format!("dupemap_fold({column}) LIKE ?1 ESCAPE '\\'")
-        } else {
-            format!("{column} LIKE ?1 ESCAPE '\\'")
-        }
+        format!(
+            "({column} LIKE ?1 ESCAPE '\\' OR ({column} GLOB '*[^ -~]*' AND dupemap_fold({column}) LIKE ?1 ESCAPE '\\'))"
+        )
     }
 }
 
-/// Lower-case every letter (not only ASCII), as names are compared in a search.
-fn fold_case(s: &str) -> String {
-    s.chars().flat_map(char::to_lowercase).collect()
+/// Lower case without accents, as names are compared in a search: `Plaża` → `plaza`,
+/// `Œuvre` → `oeuvre`, `Straße` → `strasse`. Letters without a plain form stay (lower-cased).
+pub fn fold_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().flat_map(char::to_lowercase) {
+        let plain = match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+            'æ' => "ae",
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
+            'ď' | 'đ' | 'ð' => "d",
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+            'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+            'ĥ' | 'ħ' => "h",
+            'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+            'ĵ' => "j",
+            'ķ' => "k",
+            'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+            'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => "n",
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+            'œ' => "oe",
+            'ŕ' | 'ŗ' | 'ř' => "r",
+            'ś' | 'ŝ' | 'ş' | 'š' | 'ș' => "s",
+            'ß' => "ss",
+            'ţ' | 'ť' | 'ŧ' | 'ț' => "t",
+            'þ' => "th",
+            'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+            'ŵ' => "w",
+            'ý' | 'ÿ' | 'ŷ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        out.push_str(plain);
+    }
+    out
 }
 
 /// What a hash search looks for.
@@ -190,9 +222,7 @@ pub fn search(
     match q.mode {
         SearchMode::Name => {
             let pat = NamePattern::parse(&q.text)?;
-            if pat.fold {
-                register_fold(db)?;
-            }
+            register_fold(db)?;
             if q.what != SearchWhat::Files {
                 let sql = format!("SELECT id, name FROM dir WHERE parent_id IS NOT NULL AND {}", pat.condition("name"));
                 let mut st = db.conn().prepare(&sql)?;
@@ -274,14 +304,14 @@ fn collect_files(
     Ok(())
 }
 
-/// The Unicode lower-casing used for names with non-ASCII letters.
+/// The folding used for names with characters other than plain ASCII.
 fn register_fold(db: &Db) -> Result<()> {
     db.conn().create_scalar_function(
         "dupemap_fold",
         1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let s = ctx.get_raw(0).as_str().map(fold_case).unwrap_or_default();
+            let s = ctx.get_raw(0).as_str().map(fold_text).unwrap_or_default();
             Ok(s)
         },
     )?;
@@ -356,11 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn letters_beyond_ascii_ignore_case_too() {
+    fn letters_beyond_ascii_ignore_case_and_accents() {
         let (db, ix) = fixture();
         let got = names(&db, &ix, name("świnoujście"));
         assert_eq!(got.len(), 2, "{got:?}");
         assert_eq!(names(&db, &ix, name("PLAŻA")).len(), 2);
+        // typed without the Polish letters
+        assert_eq!(names(&db, &ix, name("swinoujscie plaza")).len(), 2);
+        assert_eq!(names(&db, &ix, name("*plaza.jpg")).len(), 2);
+        assert_eq!(fold_text("Œuvre Straße ĄĆĘŁŃÓŚŹŻ"), "oeuvre strasse acelnoszz");
     }
 
     #[test]
