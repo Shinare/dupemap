@@ -73,6 +73,11 @@ impl ScanWindow {
         self.refresh(ctx);
     }
 
+    /// Still looking for drives (the screenshots wait for the list).
+    pub fn is_listing(&self) -> bool {
+        self.open && self.volumes.lock().map(|v| v.is_none()).unwrap_or(false)
+    }
+
     fn refresh(&mut self, ctx: &egui::Context) {
         if self.listing {
             return;

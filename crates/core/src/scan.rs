@@ -1369,7 +1369,9 @@ mod tests {
         let rep = db.import_file(&r.manifest, &mut |_| true).unwrap();
         assert_eq!(rep.rows_imported, 5);
         assert_eq!(rep.severity(), crate::report::Severity::Ok);
-        let ix = Index::build(&db).unwrap();
+        // (the temporary folder is under AppData on Windows, which the ignore rules hide)
+        let no_rules = crate::ignore::IgnoreSettings { enabled: false, ..Default::default() };
+        let ix = Index::build_with(&db, &no_rules, &mut |_, _| {}).unwrap();
         assert_eq!(ix.dup_group_count(), 1);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&out);

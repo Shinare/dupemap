@@ -320,7 +320,7 @@ impl DupeMapApp {
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         /// Captures in order: the main view, the duplicate groups, the summary, then one window at
         /// a time.
-        const SHOTS: [&str; 6] = ["", "groups", "summary", "ignore", "report", "manifests"];
+        const SHOTS: [&str; 9] = ["", "groups", "summary", "search", "scan", "remote", "ignore", "report", "manifests"];
         ctx.request_repaint();
         let image = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
@@ -334,7 +334,9 @@ impl DupeMapApp {
             && !self.files.is_pending()
             && !self.groups.is_pending()
             && !self.summaries.is_pending()
-            && !self.inspector.is_pending();
+            && !self.inspector.is_pending()
+            && !self.scan_win.is_listing()
+            && !self.dock.iter_all_tabs().any(|(_, t)| matches!(&t.kind, TabKind::Search(p) if p.is_pending()));
         let Some(shot) = &mut self.shot else { return };
         if let Some(img) = image {
             let name = SHOTS[(shot.stage as usize).min(SHOTS.len() - 1)];
@@ -369,6 +371,8 @@ impl DupeMapApp {
             self.ignore = None;
             self.manifests_win.open = false;
             self.reports.open = false;
+            self.scan_win.open = false;
+            self.remote_win.open = false;
             match stage {
                 0 => self.screenshot_layout(),
                 1 => self.process_simple(vec![Action::OpenGroups]),
@@ -377,8 +381,19 @@ impl DupeMapApp {
                     self.inspector.open = false;
                     self.process_simple(vec![Action::OpenSummary(Root::AllSources)]);
                 }
-                3 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
-                4 => self.reports.open = true,
+                3 => {
+                    self.inspector.open = true;
+                    self.process_simple(vec![Action::OpenSearch]);
+                    for (_, tab) in self.dock.iter_all_tabs_mut() {
+                        if let TabKind::Search(p) = &mut tab.kind {
+                            p.set_text("summer");
+                        }
+                    }
+                }
+                4 => self.scan_win.open(&self.ctx.clone()),
+                5 => self.remote_win.open = true,
+                6 => self.ignore = Some(IgnoreEditor::new(&self.current_ignore())),
+                7 => self.reports.open = true,
                 _ => self.manifests_win.open = true,
             }
         } else if shot.prepared && shot.stage == 1 && !shot.picked && shot.idle_frames >= 3 {

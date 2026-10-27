@@ -118,6 +118,18 @@ impl SearchPane {
         self.view.focus_field = true;
     }
 
+    /// Search for this right away (the screenshots).
+    pub fn set_text(&mut self, text: &str) {
+        self.draft.text = text.to_string();
+        self.view.edited_at = Some(-1.0);
+        self.view.focus_field = false;
+    }
+
+    /// A search is waiting to start or for its results.
+    pub fn is_pending(&self) -> bool {
+        self.view.pending.is_some() || self.view.edited_at.is_some()
+    }
+
     /// A reply from the search thread.
     pub fn on_result(&mut self, id: u64, generation: u64, result: Result<Arc<SearchResult>, String>, elapsed_ms: u64) {
         if self.view.pending != Some(id) || generation != self.view.generation {
@@ -161,9 +173,9 @@ impl SearchPane {
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut SearchCtx) {
         if self.view.generation != cx.generation {
-            // a new index: file numbers changed, so search again
-            let focus = self.view.focus_field;
-            self.view = View { generation: cx.generation, focus_field: focus, ..Default::default() };
+            // a new index: file numbers changed, so search again (what is being typed stays)
+            let (focus, edited_at) = (self.view.focus_field, self.view.edited_at);
+            self.view = View { generation: cx.generation, focus_field: focus, edited_at, ..Default::default() };
             if let Some(q) = self.query.clone() {
                 self.send(cx, q);
             }
@@ -426,16 +438,16 @@ impl SearchPane {
 
     fn columns(left: f32, right: f32) -> Cols {
         // Size, Copies, Source; Name and Folder share what is left
-        const MIN: [f32; 3] = [76.0, 64.0, 96.0];
+        const MIN: [f32; 3] = [100.0, 64.0, 96.0];
         let width = right - left;
         let mut shown = [true; 3];
-        // drop Source, then Copies, then Folder
+        // drop Source, then Copies, then Folder; the name keeps at least 130 px
         let need = |shown: &[bool; 3]| -> f32 {
-            150.0
-                + MIN[0]
+            130.0
+                + 84.0
+                + if shown[0] { MIN[0] } else { 0.0 }
                 + if shown[1] { MIN[1] } else { 0.0 }
                 + if shown[2] { MIN[2] } else { 0.0 }
-                + if shown[0] { 150.0 } else { 0.0 }
         };
         for k in [2usize, 1, 0] {
             if need(&shown) <= width {
@@ -782,17 +794,20 @@ fn elide_start(p: &egui::Painter, text: &str, font: &FontId, max: f32) -> String
 }
 
 fn help(ui: &mut Ui) {
-    ui.vertical_centered(|ui| {
-        ui.set_max_width(520.0);
-        ui.label(RichText::new("Find files and folders in every source").color(colors::INK_SECONDARY));
-        ui.add_space(6.0);
-        for line in [
-            "holiday: names containing it, in any case (also ą, ł, ś...)",
-            "*.mkv or IMG_20??.jpg: whole names with * (anything) and ? (one character)",
-            "a SHA-256, or its first digits: every copy of that file",
-        ] {
-            ui.label(RichText::new(line).color(colors::INK_MUTED));
-        }
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            ui.set_max_width(520.0);
+            ui.label(RichText::new("Find files and folders in every source").color(colors::INK_SECONDARY));
+            ui.add_space(6.0);
+            for line in [
+                "holiday: names containing it; case and accents do not matter (plaza finds Plaża)",
+                "*.mkv or IMG_20??.jpg: whole names, with * for anything and ? for one character",
+                "a SHA-256, or its first digits: every copy of that file",
+            ] {
+                ui.add(egui::Label::new(RichText::new(line).color(colors::INK_MUTED)).wrap());
+            }
+        });
     });
 }
 
@@ -819,8 +834,9 @@ mod tests {
         assert!(c.name.span() > 200.0 && c.folder.span() > 200.0);
         let c = SearchPane::columns(0.0, 420.0);
         assert!(!c.shown[2], "Source goes first");
-        let c = SearchPane::columns(0.0, 260.0);
+        assert!(c.shown[0] && c.shown[1], "Folder and Copies still fit at 420 px");
+        let c = SearchPane::columns(0.0, 230.0);
         assert_eq!(c.shown, [false, false, false]);
-        assert!(c.name.span() >= 150.0);
+        assert!(c.name.span() >= 130.0);
     }
 }
