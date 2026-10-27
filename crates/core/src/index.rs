@@ -114,6 +114,13 @@ pub enum SortKey {
     #[default]
     Name,
     Size,
+    /// Folders: files inside (a file counts as one).
+    Files,
+    /// Folders: files with another copy anywhere; files: copies anywhere.
+    Copies,
+    /// Folders: share of the bytes that also exist outside the folder; files: copies in other
+    /// sources.
+    Elsewhere,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -204,6 +211,19 @@ pub enum Spread {
     SeveralSources,
 }
 
+/// Order of duplicate groups. Ties keep the default order (most bytes in extra copies first).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GroupSort {
+    /// Bytes in copies beyond one.
+    #[default]
+    Extra,
+    /// Size of one copy.
+    Each,
+    Copies,
+    /// Sources holding a copy.
+    Sources,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DupQuery {
     /// Only groups with a copy in this source (database id).
@@ -212,6 +232,11 @@ pub struct DupQuery {
     pub min_copies: u32,
     #[serde(default)]
     pub spread: Spread,
+    #[serde(default)]
+    pub sort: GroupSort,
+    /// Smallest first (the default is largest first).
+    #[serde(default)]
+    pub ascending: bool,
 }
 
 /// Where the files under a folder have copies outside it.
@@ -288,6 +313,8 @@ pub struct Index {
     exts: Vec<String>,
     summaries: Vec<SourceSummary>,
     cache: Mutex<Vec<(Filter, Arc<Rollup>)>>,
+    /// Duplicate groups in a non-default order, for the last few queries.
+    group_orders: Mutex<Vec<(DupQuery, Arc<Vec<u32>>)>>,
     ignore: IgnoreSettings,
     ignore_effects: Vec<RuleEffect>,
 }
@@ -767,6 +794,7 @@ impl Index {
             exts,
             summaries: Vec::new(),
             cache: Mutex::new(Vec::new()),
+            group_orders: Mutex::new(Vec::new()),
             ignore: ignore.clone(),
             ignore_effects: effects,
         };
@@ -1281,30 +1309,73 @@ impl Index {
         set
     }
 
-    /// Duplicate groups, most wasted space first. Returns (total matching groups, page).
+    /// Duplicate groups in the query's order (by default most wasted space first). Returns
+    /// (total matching groups, page).
     pub fn dup_groups(&self, q: &DupQuery, offset: usize, limit: usize) -> (usize, Vec<DupGroup>) {
-        let pass = self.dup_pass(q);
-        let mut total = 0usize;
-        let mut page = Vec::new();
-        for &c in &self.dup_order {
-            if !pass(c) {
-                continue;
+        let group = |c: u32| {
+            let copies = self.copies(c);
+            let size = self.content_size[c as usize];
+            DupGroup {
+                content: c,
+                size,
+                copies,
+                wasted: size.saturating_mul(copies as u64 - 1),
+                sources: self.content_sources(c).len() as u32,
+                flagged: self.hot[c as usize].algo != ALGO_SHA256 as u16,
             }
-            if total >= offset && page.len() < limit {
-                let copies = self.copies(c);
-                let size = self.content_size[c as usize];
-                page.push(DupGroup {
-                    content: c,
-                    size,
-                    copies,
-                    wasted: size.saturating_mul(copies as u64 - 1),
-                    sources: self.content_sources(c).len() as u32,
-                    flagged: self.hot[c as usize].algo != ALGO_SHA256 as u16,
-                });
+        };
+        if q.sort == GroupSort::Extra && !q.ascending {
+            // the precomputed order: no sorting, no allocation beyond the page
+            let pass = self.dup_pass(q);
+            let mut total = 0usize;
+            let mut page = Vec::new();
+            for &c in &self.dup_order {
+                if !pass(c) {
+                    continue;
+                }
+                if total >= offset && page.len() < limit {
+                    page.push(group(c));
+                }
+                total += 1;
             }
-            total += 1;
+            return (total, page);
         }
-        (total, page)
+        let order = self.group_order(q);
+        let page = order.iter().skip(offset).take(limit).map(|&c| group(c)).collect();
+        (order.len(), page)
+    }
+
+    /// The groups matching `q`, sorted by its key; cached for the last few queries.
+    fn group_order(&self, q: &DupQuery) -> Arc<Vec<u32>> {
+        if let Ok(cache) = self.group_orders.lock() {
+            if let Some((_, o)) = cache.iter().find(|(k, _)| k == q) {
+                return o.clone();
+            }
+        }
+        let pass = self.dup_pass(q);
+        // start from the default order, so a stable sort breaks ties by wasted space
+        let mut order: Vec<u32> = self.dup_order.iter().copied().filter(|&c| pass(c)).collect();
+        let key = |c: u32| -> u64 {
+            match q.sort {
+                GroupSort::Extra => self.content_size[c as usize].saturating_mul(self.copies(c) as u64 - 1),
+                GroupSort::Each => self.content_size[c as usize],
+                GroupSort::Copies => self.copies(c) as u64,
+                GroupSort::Sources => self.hot[c as usize].src_len as u64,
+            }
+        };
+        if q.ascending {
+            order.sort_by_key(|&c| key(c));
+        } else {
+            order.sort_by_key(|&c| std::cmp::Reverse(key(c)));
+        }
+        let order = Arc::new(order);
+        if let Ok(mut cache) = self.group_orders.lock() {
+            if cache.len() >= 4 {
+                cache.remove(0);
+            }
+            cache.push((q.clone(), order.clone()));
+        }
+        order
     }
 
     /// Number of duplicate groups matching a query, and the bytes in their extra copies.
@@ -1519,10 +1590,21 @@ fn lca(parent: &[u32], depth: &[u16], mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// Share of a folder's bytes that also exist outside it, compared exactly (no rounding).
+fn cmp_share(a: &DirStats, b: &DirStats) -> Ordering {
+    let x = a.elsewhere_bytes as u128 * b.bytes.max(1) as u128;
+    let y = b.elsewhere_bytes as u128 * a.bytes.max(1) as u128;
+    x.cmp(&y)
+}
+
 fn dir_order(a: &DirRow, b: &DirRow, opts: &ListOptions) -> Ordering {
+    let (sa, sb) = (&a.stats, &b.stats);
     let o = match opts.sort {
         SortKey::Name => natural_cmp(&a.name, &b.name),
-        SortKey::Size => a.stats.bytes.cmp(&b.stats.bytes),
+        SortKey::Size => sa.bytes.cmp(&sb.bytes),
+        SortKey::Files => sa.files.cmp(&sb.files).then(sa.bytes.cmp(&sb.bytes)),
+        SortKey::Copies => sa.dup_files.cmp(&sb.dup_files).then(sa.bytes.cmp(&sb.bytes)),
+        SortKey::Elsewhere => cmp_share(sa, sb).then(sa.elsewhere_bytes.cmp(&sb.elsewhere_bytes)),
     };
     let o = if opts.descending { o.reverse() } else { o };
     o.then_with(|| natural_cmp(&a.name, &b.name)).then(a.dir.cmp(&b.dir))
@@ -1531,7 +1613,10 @@ fn dir_order(a: &DirRow, b: &DirRow, opts: &ListOptions) -> Ordering {
 fn file_order(a: &FileRow, b: &FileRow, opts: &ListOptions) -> Ordering {
     let o = match opts.sort {
         SortKey::Name => natural_cmp(&a.name, &b.name),
-        SortKey::Size => a.size.cmp(&b.size),
+        // every file counts as one: the biggest first among equals
+        SortKey::Size | SortKey::Files => a.size.cmp(&b.size),
+        SortKey::Copies => a.copies.cmp(&b.copies).then(a.size.cmp(&b.size)),
+        SortKey::Elsewhere => a.copies_other_sources.cmp(&b.copies_other_sources).then(a.size.cmp(&b.size)),
     };
     let o = if opts.descending { o.reverse() } else { o };
     o.then_with(|| natural_cmp(&a.name, &b.name)).then(a.file.cmp(&b.file))
@@ -1561,9 +1646,21 @@ impl Listing {
                 true
             } else {
                 let (d, f) = (&self.dirs[i], &self.files[j]);
+                let st = &d.stats;
                 let o = match opts.sort {
                     SortKey::Name => natural_cmp(&d.name, &f.name),
-                    SortKey::Size => d.stats.bytes.cmp(&f.size),
+                    SortKey::Size => st.bytes.cmp(&f.size),
+                    SortKey::Files => st.files.cmp(&1).then(st.bytes.cmp(&f.size)),
+                    SortKey::Copies => st.dup_files.cmp(&((f.copies > 1) as u32)).then(st.bytes.cmp(&f.size)),
+                    // a file is all or nothing elsewhere
+                    SortKey::Elsewhere => {
+                        let fs = DirStats {
+                            bytes: f.size,
+                            elsewhere_bytes: if f.copies_other_sources > 0 { f.size } else { 0 },
+                            ..Default::default()
+                        };
+                        cmp_share(st, &fs)
+                    }
                 };
                 let o = if opts.descending { o.reverse() } else { o };
                 // on a tie the folder goes first
@@ -1740,6 +1837,33 @@ mod tests {
         let mixed = ListOptions { folders_first: false, ..Default::default() };
         let t = ix.list(&db, Node::Dir(dir(&ix, "/mnt/tank")), &mixed).unwrap();
         assert_eq!(t.entries(&mixed).len(), 4);
+    }
+
+    #[test]
+    fn listings_sort_by_every_column() {
+        let (db, ix) = fixture();
+        let names = |node: Node, sort: SortKey, descending: bool| -> (Vec<String>, Vec<String>) {
+            let l = ix.list(&db, node, &ListOptions { sort, descending, ..Default::default() }).unwrap();
+            (l.dirs.into_iter().map(|d| d.name).collect(), l.files.into_iter().map(|f| f.name).collect())
+        };
+        let d = Node::Dir(dir(&ix, r"D:\"));
+        // Photos: 3 files, 3 with copies, half its bytes also on the NAS; Other: 1 unique file
+        assert_eq!(names(d, SortKey::Files, true).0, ["Photos", "Other"]);
+        assert_eq!(names(d, SortKey::Copies, true).0, ["Photos", "Other"]);
+        assert_eq!(names(d, SortKey::Elsewhere, true).0, ["Photos", "Other"]);
+        assert_eq!(names(d, SortKey::Elsewhere, false).0, ["Other", "Photos"]);
+        let y = Node::Dir(dir(&ix, r"D:\Photos\2019"));
+        // equal copies: the bigger file first; elsewhere: b.jpg has a copy on the NAS
+        assert_eq!(names(y, SortKey::Copies, true).1, ["b.jpg", "a.jpg"]);
+        assert_eq!(names(y, SortKey::Elsewhere, true).1, ["b.jpg", "a.jpg"]);
+        assert_eq!(names(y, SortKey::Elsewhere, false).1, ["a.jpg", "b.jpg"]);
+        let t = Node::Dir(dir(&ix, "/mnt/tank"));
+        assert_eq!(names(t, SortKey::Copies, false).1, ["s.bin", "q.bin", "q2.bin", "b.jpg"]);
+        // mixed folders and files follow the same keys
+        let mixed =
+            ListOptions { sort: SortKey::Elsewhere, descending: true, folders_first: false, ..Default::default() };
+        let l = ix.list(&db, d, &mixed).unwrap();
+        assert_eq!(l.entries(&mixed).len(), 2);
     }
 
     #[test]

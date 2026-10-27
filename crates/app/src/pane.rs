@@ -594,10 +594,10 @@ impl TreePane {
         let font = FontId::proportional(12.5);
         let titles: [(&str, Rangef, Option<SortKey>, bool, &str); 5] = [
             ("Name", cols.name, Some(SortKey::Name), false, "Click to sort by name"),
-            ("Size", cols.size, Some(SortKey::Size), true, "Total size. The bar shows the share of the parent folder; its colour shows the absolute size (darker = smaller)."),
-            ("Files", cols.files, None, true, "Files in the folder, including subfolders"),
-            ("Copies", cols.copies, None, true, "Files: copies anywhere, including this one.\nFolders: how many of the files have at least one other copy."),
-            ("Elsewhere", cols.elsewhere, None, true, "Files: copies in other sources (other machines, drives or cloud).\nFolders: share of the bytes that also exist outside the folder; ✔ when every file has a copy outside it."),
+            ("Size", cols.size, Some(SortKey::Size), true, "Total size. The bar shows the share of the parent folder; its colour shows the absolute size (darker = smaller).\nClick to sort."),
+            ("Files", cols.files, Some(SortKey::Files), true, "Files in the folder, including subfolders.\nClick to sort."),
+            ("Copies", cols.copies, Some(SortKey::Copies), true, "Files: copies anywhere, including this one.\nFolders: how many of the files have at least one other copy.\nClick to sort."),
+            ("Elsewhere", cols.elsewhere, Some(SortKey::Elsewhere), true, "Files: copies in other sources (other machines, drives or cloud).\nFolders: share of the bytes that also exist outside the folder; ✔ when every file has a copy outside it.\nClick to sort."),
         ];
         for (i, (title, x, sort, right, tip)) in titles.into_iter().enumerate() {
             if i > 0 && !cols.shown[i - 1] {
@@ -1161,7 +1161,8 @@ impl TreePane {
                         self.opts.descending = !self.opts.descending;
                     } else {
                         self.opts.sort = k;
-                        self.opts.descending = k == SortKey::Size;
+                        // names A to Z, numbers largest first
+                        self.opts.descending = k != SortKey::Name;
                     }
                     self.invalidate();
                 }
