@@ -100,7 +100,7 @@ pub fn squarify(sizes: &[f64], r: Rect) -> Vec<Rect> {
 }
 
 /// What a box stands for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Item {
     Dir(DirIx),
     File(FileIx),
@@ -134,6 +134,9 @@ pub struct TmBox {
     pub files: u32,
     /// A folder whose contents are drawn inside it, below its header strip.
     pub open: bool,
+    /// An open folder that holds only one folder (and so on) is drawn with the innermost one's
+    /// contents: that folder.
+    pub through: Option<DirIx>,
     mix: (u32, u32),
     rest: (u32, u32),
 }
@@ -147,6 +150,9 @@ pub struct Options {
     pub pad: f32,
     /// Items smaller than this (square units) are folded into the folder's "rest" box.
     pub min_area: f32,
+    /// The same for what the root holds, which may also use up the whole box budget: a folder
+    /// of thousands of similar items is shown item by item once you zoom into it.
+    pub min_area_top: f32,
     /// A folder box this wide and high has its contents drawn inside.
     pub open_w: f32,
     pub open_h: f32,
@@ -162,6 +168,7 @@ impl Default for Options {
             header: 16.0,
             pad: 2.0,
             min_area: 30.0,
+            min_area_top: 6.0,
             open_w: 44.0,
             open_h: 40.0,
             max_boxes: 20_000,
@@ -264,6 +271,14 @@ pub fn build(
                 Some(d)
             }
         };
+        // a folder holding just one folder: draw that one's contents, under one header
+        if let (Some(p), true) = (parent, kids.len() == 1) {
+            if let Item::Dir(only) = kids[0].2 {
+                tm.boxes[p as usize].through = Some(only);
+                queue.push_front((parent, Node::Dir(only), rect, depth));
+                continue;
+            }
+        }
         if parent.is_none() {
             tm.bytes = kids.iter().map(|k| k.0).sum();
             tm.files = kids.iter().map(|k| k.1 as u64).sum();
@@ -283,8 +298,10 @@ pub fn build(
         let total: u64 = kids.iter().map(|k| k.0).sum();
         let per_byte = rect.area() as f64 / total as f64;
         // big enough to draw on their own; one place is kept for the rest
-        let cap = opts.max_items.min(room).max(1);
-        let fit = kids.iter().take_while(|k| k.0 as f64 * per_byte >= opts.min_area as f64).count();
+        let (min_area, cap) =
+            if parent.is_none() { (opts.min_area_top, room) } else { (opts.min_area, opts.max_items.min(room)) };
+        let cap = cap.max(1);
+        let fit = kids.iter().take_while(|k| k.0 as f64 * per_byte >= min_area as f64).count();
         let keep = if fit == kids.len() && fit <= cap { fit } else { fit.min(cap - 1) };
         let mut placed: Vec<(u64, u32, Item)> = kids[..keep].to_vec();
         let rest_start = tm.rest.len() as u32;
@@ -306,7 +323,7 @@ pub fn build(
                 Item::Dir(_) => r.w >= opts.open_w && r.h >= opts.open_h && depth < u16::MAX - 1,
                 _ => false,
             };
-            tm.boxes.push(TmBox { rect: r, item, depth, parent, bytes, files, open, mix: (0, 0), rest });
+            tm.boxes.push(TmBox { rect: r, item, depth, parent, bytes, files, open, through: None, mix: (0, 0), rest });
             if let (true, Item::Dir(d)) = (open, item) {
                 queue.push_back((Some(b), Node::Dir(d), inner(r, opts), depth + 1));
             }
@@ -488,6 +505,11 @@ mod tests {
         let b1 = ix.dir_files(big).find(|&f| ix.copies_other_sources(f) > 0).unwrap();
         let bx = tm.find(Item::File(b1)).expect("b1 is drawn");
         assert_eq!(tm.mix(bx), [(1, 5_000_000)]);
+        // the NAS holds one folder in one folder: drawn as one box showing /data's contents
+        let nas = ix.sources().iter().position(|s| s.host == "nas").unwrap();
+        let nb = tm.find(Item::Dir(ix.sources()[nas].root)).unwrap();
+        assert_eq!(tm.boxes[nb].through.map(|d| ix.dir_path(d)), Some("/data".to_string()));
+        assert!(tm.boxes.iter().any(|b| b.parent == Some(nb as u32) && matches!(b.item, Item::File(_))));
         // the hit test finds the innermost box
         let r = tm.boxes[bx].rect;
         assert_eq!(tm.hit(r.x + r.w / 2.0, r.y + r.h / 2.0), Some(bx));
@@ -512,7 +534,7 @@ mod tests {
             Node::Dir(small),
             &Filter::default(),
             Rect::new(0.0, 0.0, 100.0, 100.0),
-            &Options { min_area: 100.0, ..Default::default() },
+            &Options { min_area: 100.0, min_area_top: 100.0, ..Default::default() },
             &|_| 0,
         );
         // 200 equal files of 50 square units each: none big enough, so one box holds them all
