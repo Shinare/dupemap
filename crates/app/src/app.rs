@@ -1608,7 +1608,7 @@ impl DupeMapApp {
         let mut open = self.keys_open;
         // near the top, and on a short screen the list scrolls rather than run off the bottom
         let screen = ctx.content_rect();
-        let max_height = (screen.height() - 180.0).max(160.0);
+        let max_height = (screen.height() - 150.0).max(160.0);
         egui::Window::new("Keyboard shortcuts")
             .open(&mut open)
             .collapsible(false)
@@ -1616,7 +1616,11 @@ impl DupeMapApp {
             .pivot(egui::Align2::CENTER_TOP)
             .default_pos(egui::pos2(screen.center().x, screen.top() + 56.0))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| Self::keys_list(ui, &KEYS));
+                // (a window that sizes itself gives a scroll area only egui's default 400 px)
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .min_scrolled_height(max_height)
+                    .show(ui, |ui| Self::keys_list(ui, &KEYS));
             });
         self.keys_open = open;
     }
