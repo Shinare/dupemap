@@ -2,6 +2,7 @@
 
 use crate::actions::{self, Action};
 use crate::categories_ui::CategoryEditor;
+use crate::checksum_ui::ChecksumDialog;
 use crate::colors;
 use crate::files::FileCache;
 use crate::format;
@@ -10,13 +11,17 @@ use crate::ignore_ui::IgnoreEditor;
 use crate::inspector::Inspector;
 use crate::manifests_ui::{ManifestsWindow, ReportWindow};
 use crate::pane::{PaneCtx, Sel, TreePane};
+use crate::scan_ui::{RemoteScanWindow, ScanCtx, ScanWindow};
+use crate::search_ui::{SearchCtx, SearchPane};
 use crate::selection::{Linked, Target};
 use crate::session::{Saver, Session, SessionOut, WindowState, VERSION};
 use crate::summary_ui::{SummaryCache, SummaryCtx, SummaryPane};
 use crate::theme;
 use crate::tree::Root;
 use crate::widgets;
-use crate::worker::{self, Inspection, Job, JobOutcome, Query, Repaint, Reply, RunningJob, Worker};
+use crate::worker::{
+    self, ImportItem, Inspection, Job, JobOutcome, Query, Repaint, Reply, RunningJob, ScanDone, Worker,
+};
 use dupemap_core::db::ManifestInfo;
 use dupemap_core::ignore::IgnoreSettings;
 use dupemap_core::index::{DirIx, FileIx, Index};
@@ -39,6 +44,8 @@ pub struct Options {
     pub session: Option<Session>,
     /// Where to autosave the session; `None` switches saving off (screenshots).
     pub session_file: Option<SessionFile>,
+    /// Open "Scan this PC" at start (after restarting as administrator for it).
+    pub open_scan: bool,
     /// Generate and import synthetic manifests of about this many rows.
     pub demo_rows: Option<u64>,
     /// Save screenshots here once loaded, then exit (CI).
@@ -69,6 +76,7 @@ pub enum TabKind {
     Tree(TreePane),
     Groups(GroupsPane),
     Summary(SummaryPane),
+    Search(SearchPane),
 }
 
 impl TabKind {
@@ -77,6 +85,7 @@ impl TabKind {
         match self {
             TabKind::Tree(p) => p.after_load(),
             TabKind::Groups(p) => p.after_load(),
+            TabKind::Search(p) => p.after_load(),
             TabKind::Summary(_) => {}
         }
     }
@@ -124,6 +133,7 @@ pub struct DupeMapApp {
     category_editor: Option<CategoryEditor>,
     /// Autosave of the session (none when saving is off).
     saver: Option<Saver>,
+    session_file: Option<SessionFile>,
     /// The text last handed to the saver.
     saved_text: String,
     last_save_check: f64,
@@ -132,6 +142,14 @@ pub struct DupeMapApp {
     inspector_width: Option<f32>,
     /// The inspected item of the saved session, selected once the index is there.
     restore_inspected: Option<Sel>,
+    /// Checksum lists waiting for their source (the first one's window is shown).
+    checksum_dialogs: VecDeque<ChecksumDialog>,
+    scan_win: ScanWindow,
+    remote_win: RemoteScanWindow,
+    /// Results of the last scan, per drive.
+    last_scan: Vec<ScanDone>,
+    /// Runs as administrator (Windows).
+    elevated: bool,
 }
 
 const STATUS_SECS: f64 = 12.0;
@@ -165,8 +183,9 @@ impl DupeMapApp {
             None => (DockState::new(vec![first]), 2, Some(1), (Inspector::default(), None, None, None)),
         };
         let (inspector, inspector_width, restore_inspected, window) = inspector;
+        let session_file = opts.session_file.clone();
         let saver = opts.session_file.map(Saver::spawn);
-        DupeMapApp {
+        let mut app = DupeMapApp {
             ctx: ctx.clone(),
             db_path: opts.db_path,
             repaint,
@@ -201,13 +220,23 @@ impl DupeMapApp {
             summaries: SummaryCache::default(),
             category_editor: None,
             saver,
+            session_file,
             saved_text: String::new(),
             last_save_check: 0.0,
             save_failed_noted: false,
             window,
             inspector_width,
             restore_inspected,
+            checksum_dialogs: VecDeque::new(),
+            scan_win: ScanWindow::default(),
+            remote_win: RemoteScanWindow::default(),
+            last_scan: Vec::new(),
+            elevated: crate::elevate::is_elevated(),
+        };
+        if opts.open_scan {
+            app.scan_win.open(&ctx);
         }
+        app
     }
 
     fn busy(&self) -> bool {
@@ -269,7 +298,7 @@ impl DupeMapApp {
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
                 TabKind::Summary(p) => p.root,
-                TabKind::Groups(_) => Root::AllSources,
+                TabKind::Groups(_) | TabKind::Search(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources);
         let (surface, node) = match self.focused.and_then(|id| self.dock.find_tab_from(|t| t.id == id)) {
@@ -456,13 +485,22 @@ impl DupeMapApp {
                     self.note("File type categories saved", false);
                 }
                 Reply::Categories(Err(e)) => self.note(format!("Could not save the categories: {e}"), true),
+                Reply::Search { pane, id, generation, result, elapsed_ms } => {
+                    for (_, tab) in self.dock.iter_all_tabs_mut() {
+                        if tab.id == pane {
+                            if let TabKind::Search(p) = &mut tab.kind {
+                                p.on_result(id, generation, result.clone(), elapsed_ms);
+                            }
+                        }
+                    }
+                }
             }
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
         });
         if !dropped.is_empty() {
-            self.queue_job(Job::Import(dropped));
+            self.queue_job(Job::Import(dropped.into_iter().map(ImportItem::decide).collect()));
         }
     }
 
@@ -500,7 +538,20 @@ impl DupeMapApp {
             self.note(n, false);
         }
         if out.cancelled {
-            self.note("Cancelled. Manifests imported before the cancel are kept.", false);
+            if out.was_scan {
+                self.note(
+                    "Scan stopped. Drives scanned completely were imported; the next scan continues where it stopped.",
+                    false,
+                );
+            } else {
+                self.note("Cancelled. Manifests imported before the cancel are kept.", false);
+            }
+        }
+        if out.was_scan {
+            self.last_scan = out.scan;
+        }
+        for ask in out.ask_checksums {
+            self.checksum_dialogs.push_back(ChecksumDialog::new(ask));
         }
         if let Some(e) = out.error {
             self.note(e, true);
@@ -705,7 +756,21 @@ impl DupeMapApp {
                 Action::SetCategories(c) => self.worker.send(Query::SetCategories(c)),
                 Action::ToggleInspector => self.inspector.open = !self.inspector.open,
                 Action::OpenInspector => self.inspector.open = true,
-                Action::ImportPaths(p) => self.queue_job(Job::Import(p)),
+                Action::ImportPaths(p) => self.queue_job(Job::Import(p.into_iter().map(ImportItem::decide).collect())),
+                Action::ImportAs(path, how) => self.queue_job(Job::Import(vec![ImportItem { path, how: Some(how) }])),
+                Action::OpenSearch => self.open_search(),
+                Action::OpenScan => self.scan_win.open(&self.ctx.clone()),
+                Action::OpenRemoteScan => self.remote_win.open = true,
+                Action::StartScan(targets, settings) => {
+                    let out_dir = self.scans_dir();
+                    self.queue_job(Job::Scan { targets, settings, out_dir });
+                }
+                Action::RestartElevated => self.restart_elevated(),
+                Action::CancelJob => {
+                    if let Some(j) = &self.job {
+                        j.cancel();
+                    }
+                }
                 Action::RemoveManifests(ids) => self.queue_job(Job::Remove(ids)),
                 Action::ShowReport(id) => self.worker.send(Query::Report { manifest_id: id }),
                 Action::SetAlertDismissed(id, d) => {
@@ -831,9 +896,55 @@ impl DupeMapApp {
             .map(|(_, t)| match &t.kind {
                 TabKind::Tree(p) => p.root,
                 TabKind::Summary(p) => p.root,
-                TabKind::Groups(_) => Root::AllSources,
+                TabKind::Groups(_) | TabKind::Search(_) => Root::AllSources,
             })
             .unwrap_or(Root::AllSources)
+    }
+
+    /// Switch to the search tab (opening it beside the tree the first time) and put the cursor
+    /// in its field.
+    fn open_search(&mut self) {
+        let mut existing = None;
+        for (_, tab) in self.dock.iter_all_tabs_mut() {
+            if let TabKind::Search(p) = &mut tab.kind {
+                p.focus();
+                existing = Some(tab.id);
+                break;
+            }
+        }
+        if let Some(id) = existing {
+            self.activate_tab(id);
+            return;
+        }
+        let tab = Tab { id: self.new_tab_id(), kind: TabKind::Search(SearchPane::default()) };
+        let id = tab.id;
+        if self.dock.iter_all_tabs().count() == 1 {
+            self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.5, vec![tab]);
+        } else {
+            self.dock.push_to_focused_leaf(tab);
+        }
+        self.activate_tab(id);
+    }
+
+    /// Where the built-in scan saves its manifests: beside the database.
+    fn scans_dir(&self) -> PathBuf {
+        self.db_path.parent().map(|p| p.join("scans")).unwrap_or_else(|| PathBuf::from("scans"))
+    }
+
+    /// Save the session and start DupeMap again as administrator, with the scan window open.
+    fn restart_elevated(&mut self) {
+        self.save_on_exit();
+        let args = vec!["--db".to_string(), self.db_path.display().to_string(), "--scan".to_string()];
+        match crate::elevate::restart_elevated(&args) {
+            Ok(()) => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                // keep saving the session here
+                if let Some(f) = self.session_file.clone() {
+                    self.saver = Some(Saver::spawn(f));
+                }
+                self.note(format!("Not restarted: {e}"), true);
+            }
+        }
     }
 
     /// Switch to the duplicate groups tab, opening it beside the tree the first time.
@@ -892,6 +1003,19 @@ impl DupeMapApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Scan this PC…").on_hover_text("Hash this computer's drives and import them").clicked() {
+                    actions.push(Action::OpenScan);
+                    ui.close();
+                }
+                if ui
+                    .button("Scan another computer…")
+                    .on_hover_text("Save a script to run on another Windows or Linux computer")
+                    .clicked()
+                {
+                    actions.push(Action::OpenRemoteScan);
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Ignored folders…").clicked() {
                     actions.push(Action::OpenIgnoreEditor);
                     ui.close();
@@ -916,6 +1040,10 @@ impl DupeMapApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.add(egui::Button::new("Search").shortcut_text("Ctrl+F")).clicked() {
+                    actions.push(Action::OpenSearch);
+                    ui.close();
+                }
                 if ui.add(egui::Button::new("Duplicate groups").shortcut_text("Ctrl+G")).clicked() {
                     actions.push(Action::OpenGroups);
                     ui.close();
@@ -1059,23 +1187,37 @@ impl DupeMapApp {
                 ui.add(egui::Spinner::new().size(20.0));
                 return;
             }
-            if ui
-                .add(egui::Button::new(RichText::new("Import manifests…").size(15.0)).min_size(egui::vec2(200.0, 32.0)))
-                .clicked()
+            let size = egui::vec2(220.0, 32.0);
+            if ui.add(egui::Button::new(RichText::new("Scan this PC…").size(15.0)).min_size(size)).clicked() {
+                actions.push(Action::OpenScan);
+            }
+            ui.label(
+                RichText::new("hash this computer's drives (its own, USB, network) and import them")
+                    .color(colors::INK_MUTED),
+            );
+            ui.add_space(10.0);
+            if ui.add(egui::Button::new(RichText::new("Scan another computer…").size(15.0)).min_size(size)).clicked()
             {
+                actions.push(Action::OpenRemoteScan);
+            }
+            ui.label(
+                RichText::new("save a script to run on another Windows or Linux computer").color(colors::INK_MUTED),
+            );
+            ui.add_space(10.0);
+            if ui.add(egui::Button::new(RichText::new("Import manifests…").size(15.0)).min_size(size)).clicked() {
                 actions.push(Action::Import);
             }
-            ui.add_space(10.0);
             ui.label(
-                RichText::new("or drop manifest-*.tsv files (or a folder of them) anywhere on this window")
+                RichText::new("or drop manifests or checksum lists (or a folder of them) anywhere on this window")
                     .color(colors::INK_MUTED),
             );
             ui.add_space(18.0);
             ui.label(
                 RichText::new(
-                    "Manifests come from the export-hashes scripts: one line per file with its SHA-256, size, \
-                     source and path. Import one per machine, drive or cloud account; DupeMap shows every copy of \
-                     every file across all of them. It never deletes anything itself.",
+                    "A manifest lists one line per file with its SHA-256, size, source and path; the scan and the \
+                     export scripts write them, and checksum lists from sha256sum or rclone hashsum import too. \
+                     Import one per machine, drive or cloud account; DupeMap shows every copy of every file across \
+                     all of them. It never deletes anything itself.",
                 )
                 .color(colors::INK_MUTED),
             );
@@ -1152,7 +1294,7 @@ impl DupeMapApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         use egui::{Key, KeyboardShortcut, Modifiers};
-        let (open, tab, quit, groups, inspector, summary) = ctx.input_mut(|i| {
+        let (open, tab, quit, groups, inspector, summary, find) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::T)),
@@ -1160,8 +1302,12 @@ impl DupeMapApp {
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::G)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::I)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::U)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F)),
             )
         });
+        if find {
+            actions.push(Action::OpenSearch);
+        }
         if summary {
             actions.push(Action::OpenSummary(self.focused_root()));
         }
@@ -1289,6 +1435,34 @@ impl eframe::App for DupeMapApp {
                 self.category_editor = None;
             }
         }
+        // checksum lists waiting for their source, one at a time
+        let sources: Vec<String> =
+            self.index.as_ref().map(|ix| ix.sources().iter().map(|s| s.host.clone()).collect()).unwrap_or_default();
+        if let Some(d) = self.checksum_dialogs.front_mut() {
+            if !d.show(&ctx, &sources, Some(frame), &mut actions) {
+                self.checksum_dialogs.pop_front();
+            }
+        }
+        {
+            let progress = self.job.as_ref().map(|j| (j.progress(), j.is_cancelling()));
+            let running = progress.as_ref().and_then(|(p, _)| p.scan.clone());
+            let out_dir = self.scans_dir();
+            let mut cx = ScanCtx {
+                running: running.as_ref(),
+                busy: self.busy(),
+                cancelling: progress.as_ref().is_some_and(|(_, c)| *c),
+                last: &self.last_scan,
+                elevated: self.elevated,
+                out_dir: &out_dir,
+                actions: &mut actions,
+            };
+            self.scan_win.show(&ctx, &mut cx);
+            if running.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
+        let scripts_dir = self.db_path.parent().map(PathBuf::from).unwrap_or_default();
+        self.remote_win.show(&ctx, Some(frame), &scripts_dir, &mut actions);
         if self.about {
             self.about_window(&ctx);
         }
@@ -1346,6 +1520,7 @@ impl TabViewer for Viewer<'_> {
             }
             TabKind::Groups(g) => g.title().into(),
             TabKind::Summary(p) => p.title(Some(self.ix)).into(),
+            TabKind::Search(p) => p.title().into(),
         }
     }
 
@@ -1377,6 +1552,18 @@ impl TabViewer for Viewer<'_> {
                     linked: self.linked,
                 };
                 g.ui(ui, &mut cx);
+            }
+            TabKind::Search(p) => {
+                let mut cx = SearchCtx {
+                    ix: self.ix,
+                    generation: self.generation,
+                    worker: self.worker,
+                    actions: self.actions,
+                    pane_id: tab.id,
+                    focused: self.focused == Some(tab.id),
+                    linked: self.linked,
+                };
+                p.ui(ui, &mut cx);
             }
             TabKind::Summary(p) => {
                 let mut cx = SummaryCtx {

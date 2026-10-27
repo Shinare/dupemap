@@ -44,6 +44,19 @@ pub enum Action {
     OpenCategories,
     /// Store new file-type categories.
     SetCategories(dupemap_core::summary::Categories),
+    /// Import one file in a given way (a checksum list with its source).
+    ImportAs(PathBuf, dupemap_core::db::ImportAs),
+    /// Open (or switch to) the search tab.
+    OpenSearch,
+    /// The "Scan this PC" window.
+    OpenScan,
+    /// The "Scan another computer" window.
+    OpenRemoteScan,
+    StartScan(Vec<crate::worker::ScanTarget>, dupemap_core::scan::ScanSettings),
+    /// Start DupeMap again as administrator (for the scan).
+    RestartElevated,
+    /// Stop the running job (a scan keeps what it hashed).
+    CancelJob,
 }
 
 /// Whether a manifest host names this computer ("PC1" or "PC1 D: (Media)" on PC1).

@@ -58,9 +58,9 @@ fn kind_text(k: DriveKind) -> &'static str {
 
 /// `1 MB`, `100 KB`, `250000 bytes`.
 pub fn size_text(n: u64) -> String {
-    if n >= 1 << 20 && n % (1 << 20) == 0 {
+    if n >= 1 << 20 && n.is_multiple_of(1 << 20) {
         format!("{} MB", n >> 20)
-    } else if n >= 1 << 10 && n % (1 << 10) == 0 {
+    } else if n >= 1 << 10 && n.is_multiple_of(1 << 10) {
         format!("{} KB", n >> 10)
     } else {
         format!("{n} bytes")
