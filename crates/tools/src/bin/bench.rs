@@ -261,6 +261,32 @@ fn main() {
         t.ms(&format!("summary by file type, biggest source ({} files)", big.files), s);
     }
 
+    // search (each pass reads the whole file table)
+    use dupemap_core::search::{search, SearchMode, SearchQuery, MAX_HITS};
+    let run = |label: &str, q: SearchQuery, t: &mut Table| {
+        let s = Instant::now();
+        match search(&db, &ix, &q, MAX_HITS, &|| true) {
+            Ok(r) => {
+                t.ms(&format!("{label}: {} hits{}", r.hits.len(), if r.truncated { "+" } else { "" }), s);
+            }
+            Err(e) => t.add(label, format!("error: {e}")),
+        }
+    };
+    let name = |text: &str| SearchQuery { text: text.into(), ..Default::default() };
+    run("search names, no match", name("no such name anywhere"), &mut t);
+    run("search names, a word", name("summer"), &mut t);
+    run("search names with Polish letters (Unicode case)", name("Świat"), &mut t);
+    run("search names, pattern *.mkv", name("*.mkv"), &mut t);
+    let full: Option<String> = db
+        .conn()
+        .query_row("SELECT hex(digest) FROM file WHERE algo_id = 0 LIMIT 1 OFFSET 1000", [], |r| r.get(0))
+        .ok();
+    if let Some(full) = full {
+        let hash = |text: &str| SearchQuery { text: text.into(), mode: SearchMode::Hash, ..Default::default() };
+        run("search a full SHA-256", hash(&full), &mut t);
+        run("search the first 8 digits of a hash", hash(&full[..8]), &mut t);
+    }
+
     drop(ix);
     drop(db);
     let mut db = Db::open(&db_path).unwrap();

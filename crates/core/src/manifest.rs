@@ -9,10 +9,167 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::io::{self, BufRead, BufReader, Cursor, Read};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 /// The header line written by all export scripts.
 pub const HEADER: &str = "hash\tsize\thost\tpath";
+
+/// The two kinds of hash lists DupeMap reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ListFormat {
+    /// `hash<TAB>size<TAB>host<TAB>path`, as written by the export scripts and the built-in scan.
+    #[default]
+    Manifest,
+    /// A checksum list: `hash  path` per line, as written by `sha256sum` or `rclone hashsum`
+    /// (also `hash *path` and BSD-style `SHA256 (path) = hash`). No size and no source: the
+    /// source is given at import, sizes are filled in from elsewhere where possible.
+    Checksums,
+}
+
+/// How a file is read on import.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportAs {
+    /// `hash<TAB>size<TAB>host<TAB>path`, as written by the export scripts and the built-in scan.
+    #[default]
+    Manifest,
+    /// A checksum list (`hash  path` per line, as written by `sha256sum` or `rclone hashsum`).
+    Checksums(ChecksumImport),
+}
+
+/// What a checksum list does not say for itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksumImport {
+    /// The source every row belongs to: `onedrive:` for an rclone remote, a computer's name...
+    pub host: String,
+    /// Put in front of relative paths: `onedrive:` (rclone lists paths relative to the remote),
+    /// `/mnt/tank/media/`, `D:\Photos\`. Empty, or an absolute path in the list: used as it is.
+    pub base: String,
+    /// Optional sizes: `size<TAB>path` per line (what `rclone lsf --format sp` writes), with the
+    /// paths written as in the checksum list.
+    #[serde(default)]
+    pub sizes: Option<PathBuf>,
+}
+
+impl ChecksumImport {
+    /// The full path of a listed path: the base in front of a relative one.
+    pub fn full_path<'p>(&self, p: &'p [u8]) -> Cow<'p, [u8]> {
+        let p = p.strip_prefix(b"./").unwrap_or(p);
+        if self.base.is_empty() || is_absolute(p) {
+            return Cow::Borrowed(p);
+        }
+        let base = self.base.as_bytes();
+        // a Windows base gets Windows separators throughout
+        let windows = base.len() >= 2 && base[1] == b':' && base[0].is_ascii_alphabetic() || base.starts_with(br"\\");
+        let sep = if windows { b'\\' } else { b'/' };
+        let mut v = Vec::with_capacity(base.len() + 1 + p.len());
+        v.extend_from_slice(base);
+        if !matches!(base.last(), Some(b'/' | b'\\' | b':')) {
+            v.push(sep);
+        }
+        if windows {
+            v.extend(p.iter().map(|&b| if b == b'/' { b'\\' } else { b }));
+        } else {
+            v.extend_from_slice(p);
+        }
+        Cow::Owned(v)
+    }
+}
+
+/// Does a listed path stand on its own (`/x`, `C:\x`, `\\server\x`, `remote:x`)?
+fn is_absolute(p: &[u8]) -> bool {
+    p.starts_with(b"/")
+        || p.starts_with(br"\\")
+        || (p.len() >= 2 && p[1] == b':' && p[0].is_ascii_alphabetic())
+        || crate::paths::parse_path(p).kind == crate::paths::PathKind::Cloud
+}
+
+/// Cloud services whose rclone remotes are usually named after them.
+const CLOUD_WORDS: &[&str] = &[
+    "onedrive",
+    "gdrive",
+    "google",
+    "googledrive",
+    "drive",
+    "dropbox",
+    "box",
+    "mega",
+    "pcloud",
+    "icloud",
+    "s3",
+    "b2",
+    "cloud",
+    "remote",
+    "proton",
+    "protondrive",
+    "koofr",
+    "jottacloud",
+    "yandex",
+    "sharepoint",
+];
+
+/// A first guess at the source of a checksum list, from its file name and first paths:
+/// `onedrive-hashsum.txt` with relative paths is the rclone remote `onedrive:`. Paths that are
+/// already absolute keep their own anchor (no base).
+pub fn guess_checksums(file_name: &str, first_paths: &[&[u8]]) -> ChecksumImport {
+    let stem = file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(file_name);
+    let tokens: Vec<&str> = stem.split(['-', '_', '.', ' ']).filter(|t| !t.is_empty()).collect();
+    let is_cloud = |t: &str| CLOUD_WORDS.contains(&t.to_ascii_lowercase().as_str());
+    // a cloud service named anywhere in the name wins; otherwise the first word that is not a
+    // hash-like or common word ("manifest", "sha256", "hashes", numbers...)
+    let plain = |t: &str| {
+        let l = t.to_ascii_lowercase();
+        !t.chars().all(|c| c.is_ascii_hexdigit())
+            && !matches!(
+                l.as_str(),
+                "manifest" | "sha256" | "sha256sum" | "sha256sums" | "hashes" | "hashsum" | "checksums" | "rclone"
+            )
+    };
+    let token: String = tokens
+        .iter()
+        .find(|t| is_cloud(t))
+        .or_else(|| tokens.iter().find(|t| plain(t)))
+        .copied()
+        .unwrap_or("checksums")
+        .to_string();
+    let lower = file_name.to_ascii_lowercase();
+    let relative = !first_paths.is_empty() && first_paths.iter().all(|p| !is_absolute(p));
+    let cloudish = tokens.iter().any(|t| is_cloud(t)) || lower.contains("hashsum") || lower.contains("rclone");
+    if relative && cloudish {
+        let remote = format!("{}:", token.trim_end_matches(':'));
+        ChecksumImport { host: remote.clone(), base: remote, sizes: None }
+    } else {
+        ChecksumImport { host: token, base: String::new(), sizes: None }
+    }
+}
+
+/// A size list saved next to a checksum list by the cloud download script:
+/// `onedrive-hashsum.txt` → `onedrive-sizes.tsv` (also `<name>-sizes.tsv`, `<name>.sizes.tsv`).
+pub fn find_size_list(checksums: &std::path::Path) -> Option<PathBuf> {
+    let dir = checksums.parent()?;
+    let name = checksums.file_name()?.to_string_lossy().into_owned();
+    let stem = name.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or(name.clone());
+    let mut cands = vec![format!("{stem}-sizes.tsv"), format!("{stem}.sizes.tsv")];
+    if let Some(base) = stem.strip_suffix("-hashsum").or_else(|| stem.strip_suffix("_hashsum")) {
+        cands.insert(0, format!("{base}-sizes.tsv"));
+    }
+    cands.into_iter().map(|c| dir.join(c)).find(|p| p.is_file())
+}
+
+/// The first paths of a checksum list (for [`guess_checksums`]).
+pub fn first_checksum_paths(r: impl Read, n: usize) -> io::Result<Vec<Vec<u8>>> {
+    let (mut lines, _) = LineReader::new(r.take(256 * 1024))?;
+    let mut out = Vec::new();
+    while let Some((_, l)) = lines.next_line()? {
+        if let Ok(c) = parse_checksum_line(l) {
+            out.push(c.path.into_owned());
+            if out.len() >= n {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// A row's content hash.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,6 +249,10 @@ pub enum Malformed {
     EmptyHost,
     EmptyPath,
     NoFileName,
+    /// A line of a checksum list that is not `hash  path`.
+    NotChecksumLine,
+    /// rclone wrote `ERROR` or `UNSUPPORTED` instead of a hash (the file could not be read).
+    NoHash,
 }
 
 impl Malformed {
@@ -103,6 +264,8 @@ impl Malformed {
             Malformed::EmptyHost => "empty host",
             Malformed::EmptyPath => "empty path",
             Malformed::NoFileName => "path has no file name",
+            Malformed::NotChecksumLine => "not a checksum line",
+            Malformed::NoHash => "no hash (rclone could not read the file)",
         }
     }
 }
@@ -113,7 +276,8 @@ pub struct Row<'a> {
     pub digest: Digest,
     /// `sha256:<hex>` was accepted as plain SHA-256.
     pub prefixed_sha256: bool,
-    pub size: u64,
+    /// `None` when the list has no sizes (checksum lists).
+    pub size: Option<u64>,
     pub host: Cow<'a, str>,
     pub path: &'a [u8],
 }
@@ -144,7 +308,148 @@ pub fn parse_row(line: &[u8]) -> Result<Row<'_>, Malformed> {
         return Err(Malformed::EmptyPath);
     }
     let host = String::from_utf8_lossy(host);
-    Ok(Row { digest, prefixed_sha256, size, host, path })
+    Ok(Row { digest, prefixed_sha256, size: Some(size), host, path })
+}
+
+/// One line of a checksum list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumLine<'a> {
+    pub digest: Digest,
+    /// The path as written (unescaped when the line used `sha256sum`'s backslash escapes).
+    pub path: Cow<'a, [u8]>,
+}
+
+/// Parse one line of a checksum list:
+/// * `hash  path` (`sha256sum`, `rclone hashsum`), `hash *path` (binary mode), `hash<TAB>path`
+/// * `\hash  pa\\th` (GNU escaping of names with a backslash or a line break)
+/// * `SHA256 (path) = hash` (BSD / `--tag` style)
+///
+/// The hash length decides the algorithm: 64 hex digits are SHA-256, others are flagged (32 =
+/// md5, 40 = sha1, ...). Returns the reason when the line is not usable.
+pub fn parse_checksum_line(line: &[u8]) -> Result<ChecksumLine<'_>, Malformed> {
+    let trimmed = line.trim_ascii_start();
+    if trimmed.starts_with(b"ERROR") || trimmed.starts_with(b"UNSUPPORTED") {
+        return Err(Malformed::NoHash);
+    }
+    // BSD style: ALGO (path) = hash
+    if let Some(open) = line.windows(2).position(|w| w == b" (") {
+        let tag = &line[..open];
+        if !tag.is_empty() && tag.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+            if let Some(close) = line.windows(4).rposition(|w| w == b") = ") {
+                if close > open + 2 {
+                    let hex = line[close + 4..].trim_ascii();
+                    if !hex.is_empty() && hex.iter().all(u8::is_ascii_hexdigit) {
+                        let path = &line[open + 2..close];
+                        let algo = String::from_utf8_lossy(tag).to_ascii_lowercase().replace('-', "");
+                        return Ok(ChecksumLine {
+                            digest: checksum_digest(hex, Some(&algo)),
+                            path: Cow::Borrowed(path),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let (escaped, body) = match line.strip_prefix(b"\\") {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    let hex_len = body.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+    if !(16..=128).contains(&hex_len) {
+        return Err(Malformed::NotChecksumLine);
+    }
+    let rest = &body[hex_len..];
+    let path = if let Some(p) = rest.strip_prefix(b"  ").or_else(|| rest.strip_prefix(b" *")) {
+        p
+    } else if let Some(p) = rest.strip_prefix(b"\t") {
+        p
+    } else {
+        return Err(Malformed::NotChecksumLine);
+    };
+    if path.is_empty() {
+        return Err(Malformed::EmptyPath);
+    }
+    let path = if escaped { Cow::Owned(unescape_name(path)) } else { Cow::Borrowed(path) };
+    Ok(ChecksumLine { digest: checksum_digest(&body[..hex_len], None), path })
+}
+
+/// `sha256sum` writes `\\` for a backslash and `\n` for a line break in an escaped name.
+fn unescape_name(p: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(p.len());
+    let mut i = 0;
+    while i < p.len() {
+        if p[i] == b'\\' && i + 1 < p.len() {
+            match p[i + 1] {
+                b'\\' => out.push(b'\\'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                other => {
+                    out.push(b'\\');
+                    out.push(other);
+                }
+            }
+            i += 2;
+        } else {
+            out.push(p[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A checksum list's hash: SHA-256 when it is one, flagged otherwise (named by the BSD tag or
+/// guessed from the length).
+fn checksum_digest(hex: &[u8], tag: Option<&str>) -> Digest {
+    if tag.is_none_or(|t| t == "sha256") {
+        if let Some(d) = hex32(hex) {
+            return Digest::Sha256(d);
+        }
+    }
+    let algo = match tag {
+        Some(t) if !t.is_empty() && t.len() <= 32 => t.to_string(),
+        _ => match hex.len() {
+            32 => "md5".to_string(),
+            40 => "sha1".to_string(),
+            56 => "sha224".to_string(),
+            96 => "sha384".to_string(),
+            128 => "sha512".to_string(),
+            n => format!("hex{n}?"),
+        },
+    };
+    Digest::Other { algo, value: String::from_utf8_lossy(hex).to_ascii_lowercase() }
+}
+
+/// Decide from the first lines of a file whether it is a manifest or a checksum list. Anything
+/// with tab-separated columns (or the manifest header) is a manifest, so a damaged manifest
+/// still gets its import report instead of being read as something else.
+pub fn detect_format<'l>(lines: impl IntoIterator<Item = &'l [u8]>) -> ListFormat {
+    let mut checksum = 0;
+    for l in lines.into_iter().filter(|l| !l.trim_ascii().is_empty()).take(20) {
+        if is_header(l) || l.iter().filter(|&&b| b == b'\t').count() >= 3 {
+            return ListFormat::Manifest;
+        }
+        if parse_checksum_line(l).is_ok() {
+            checksum += 1;
+        }
+    }
+    if checksum > 0 {
+        ListFormat::Checksums
+    } else {
+        ListFormat::Manifest
+    }
+}
+
+/// Read the first lines of a file (any supported encoding) and decide its format.
+pub fn sniff_format(r: impl Read) -> io::Result<ListFormat> {
+    let (mut lines, _) = LineReader::new(r.take(64 * 1024))?;
+    let mut first = Vec::new();
+    while let Some((_, l)) = lines.next_line()? {
+        first.push(l.to_vec());
+        if first.len() >= 20 {
+            break;
+        }
+    }
+    Ok(detect_format(first.iter().map(|v| v.as_slice())))
 }
 
 fn parse_digest(h: &[u8]) -> Result<(Digest, bool), Malformed> {
@@ -432,7 +737,7 @@ mod tests {
         let line = format!("{H}\t1048576\tPC1 D: (Media)\tD:\\Videos\\a b.mkv");
         let r = parse_row(line.as_bytes()).unwrap();
         assert!(r.digest.is_sha256());
-        assert_eq!(r.size, 1048576);
+        assert_eq!(r.size, Some(1048576));
         assert_eq!(r.host, "PC1 D: (Media)");
         assert_eq!(r.path, br"D:\Videos\a b.mkv");
         assert_eq!(r.digest.display(), H);
@@ -548,6 +853,93 @@ mod tests {
         let (mut r, _) = LineReader::new(OneByte(Cursor::new(le))).unwrap();
         let l = r.next_line().unwrap().unwrap().1.to_vec();
         assert_eq!(String::from_utf8(l).unwrap(), "a😀b\u{FFFD}c");
+    }
+
+    #[test]
+    fn checksum_lines() {
+        let gnu = format!("{H}  Folder/a b.mp4");
+        let c = parse_checksum_line(gnu.as_bytes()).unwrap();
+        assert_eq!(c.digest.display(), H);
+        assert_eq!(c.path.as_ref(), b"Folder/a b.mp4");
+        // GNU: hash, a space, the mode character (space = text, * = binary), the name; so after
+        // two spaces a leading * belongs to the name
+        let bin = format!("{}  *x.bin", H.to_ascii_uppercase());
+        assert_eq!(parse_checksum_line(bin.as_bytes()).unwrap().path.as_ref(), b"*x.bin");
+        let bin = format!("{H} *x.bin");
+        assert_eq!(parse_checksum_line(bin.as_bytes()).unwrap().path.as_ref(), b"x.bin");
+        let tab = format!("{H}\t  spaced.txt");
+        assert_eq!(parse_checksum_line(tab.as_bytes()).unwrap().path.as_ref(), b"  spaced.txt");
+        // GNU escaping
+        let esc = format!("\\{H}  a\\\\b\\nc");
+        assert_eq!(parse_checksum_line(esc.as_bytes()).unwrap().path.as_ref(), b"a\\b\nc");
+        // BSD tag style, path with parentheses and " = " inside
+        let bsd = format!("SHA256 (dir/x (1) = y.txt) = {H}");
+        let b = parse_checksum_line(bsd.as_bytes()).unwrap();
+        assert_eq!(b.path.as_ref(), b"dir/x (1) = y.txt");
+        assert!(b.digest.is_sha256());
+        let md5 = parse_checksum_line(b"MD5 (a.txt) = 0123456789ABCDEF0123456789ABCDEF").unwrap();
+        assert_eq!(md5.digest.algo_name(), "md5");
+        // other lengths are flagged
+        let sha1 = parse_checksum_line(b"0123456789abcdef0123456789abcdef01234567  f").unwrap();
+        assert_eq!(sha1.digest.algo_name(), "sha1");
+        assert_eq!(parse_checksum_line(b"ERROR                     some/file").unwrap_err(), Malformed::NoHash);
+        assert_eq!(parse_checksum_line(b"hello world").unwrap_err(), Malformed::NotChecksumLine);
+        assert_eq!(parse_checksum_line(format!("{H} x").as_bytes()).unwrap_err(), Malformed::NotChecksumLine);
+        assert_eq!(parse_checksum_line(format!("{H}  ").as_bytes()).unwrap_err(), Malformed::EmptyPath);
+    }
+
+    #[test]
+    fn guessing_the_source_of_a_checksum_list() {
+        let rel: Vec<&[u8]> = vec![b"Docs/a.pdf", b"b.mp4"];
+        let g = guess_checksums("onedrive-hashsum.txt", &rel);
+        assert_eq!((g.host.as_str(), g.base.as_str()), ("onedrive:", "onedrive:"));
+        let g = guess_checksums("onedrive-sha256-example.txt", &rel);
+        assert_eq!(g.host, "onedrive:");
+        let g = guess_checksums("gdrive_hashes.txt", &rel);
+        assert_eq!(g.host, "gdrive:");
+        // a name that is not a cloud service: a source of that name, paths as listed
+        let g = guess_checksums("nas-sha256.txt", &rel);
+        assert_eq!((g.host.as_str(), g.base.as_str()), ("nas", ""));
+        // absolute paths keep their own anchor
+        let abs: Vec<&[u8]> = vec![b"/mnt/tank/a", b"/mnt/tank/b"];
+        let g = guess_checksums("onedrive.txt", &abs);
+        assert_eq!((g.host.as_str(), g.base.as_str()), ("onedrive", ""));
+        assert_eq!(guess_checksums(".txt", &rel).host, "checksums");
+        // an upload prefix or a hash-like word in front does not hide the service
+        assert_eq!(guess_checksums("e8309321-onedrive-sha256-example.txt", &rel).host, "onedrive:");
+        assert_eq!(guess_checksums("sha256-photos.txt", &rel).host, "photos");
+    }
+
+    #[test]
+    fn size_lists_next_to_a_checksum_list_are_found() {
+        let dir = std::env::temp_dir().join(format!("dupemap-sizelist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("onedrive-hashsum.txt"), "").unwrap();
+        assert_eq!(find_size_list(&dir.join("onedrive-hashsum.txt")), None);
+        std::fs::write(dir.join("onedrive-sizes.tsv"), "").unwrap();
+        assert_eq!(find_size_list(&dir.join("onedrive-hashsum.txt")), Some(dir.join("onedrive-sizes.tsv")));
+        std::fs::write(dir.join("photos.txt"), "").unwrap();
+        std::fs::write(dir.join("photos.sizes.tsv"), "").unwrap();
+        assert_eq!(find_size_list(&dir.join("photos.txt")), Some(dir.join("photos.sizes.tsv")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_detection() {
+        let list = format!("{H}  a.txt\n{H}  b/c.txt\n");
+        assert_eq!(sniff_format(Cursor::new(list.into_bytes())).unwrap(), ListFormat::Checksums);
+        let man = format!("{HEADER}\n{H}\t1\th\t/x\n");
+        assert_eq!(sniff_format(Cursor::new(man.into_bytes())).unwrap(), ListFormat::Manifest);
+        // a manifest without its header is still a manifest
+        let headless = format!("{H}\t1\th\t/x\n");
+        assert_eq!(sniff_format(Cursor::new(headless.into_bytes())).unwrap(), ListFormat::Manifest);
+        assert_eq!(sniff_format(Cursor::new(b"random text\n".to_vec())).unwrap(), ListFormat::Manifest);
+        // UTF-16 checksum list (re-saved by an editor)
+        let mut le = vec![0xFF, 0xFE];
+        for u in format!("{H}  x.txt\r\n").encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(sniff_format(Cursor::new(le)).unwrap(), ListFormat::Checksums);
     }
 
     #[test]

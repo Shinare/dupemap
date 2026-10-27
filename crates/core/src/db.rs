@@ -5,12 +5,14 @@
 //! file scanned twice can never be counted as two copies. Removing a manifest restores the
 //! listings it was hiding.
 //!
-//! Which listing wins: a SHA-256 listing beats a flagged one; otherwise the newer scan wins
-//! (manifest file date, falling back to import time), and on a tie the later import.
+//! Which listing wins: a SHA-256 listing beats a flagged one, then a listing with a size beats
+//! one without (checksum lists have no sizes); otherwise the newer scan wins (manifest file date,
+//! falling back to import time), and on a tie the later import.
 
 use crate::error::{err, Error, Result};
 use crate::ignore::IgnoreSettings;
-use crate::manifest::{is_header, parse_row, Counting, Digest, LineReader, Malformed, Row};
+use crate::manifest::{is_header, parse_checksum_line, parse_row, Counting, Digest, LineReader, Malformed, Row};
+pub use crate::manifest::{ChecksumImport, ImportAs};
 use crate::paths::{self, Comp, PathKind};
 use crate::report::{ImportReport, Overlap, Samples, Severity};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -21,7 +23,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: i64 = 2;
+/// 3: `file.size` is -1 for a file whose size is not known (rows from a checksum list).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Algorithm id reserved for SHA-256.
 pub const ALGO_SHA256: i64 = 0;
@@ -76,7 +79,7 @@ CREATE TABLE IF NOT EXISTS file (
     name        TEXT NOT NULL,
     name_key    TEXT,
     raw         BLOB,
-    size        INTEGER NOT NULL,
+    size        INTEGER NOT NULL, -- -1 = not known (checksum lists have no sizes)
     algo_id     INTEGER NOT NULL,
     digest      BLOB NOT NULL,
     ext_id      INTEGER NOT NULL,
@@ -92,6 +95,21 @@ CREATE TABLE IF NOT EXISTS setting (
 INSERT OR IGNORE INTO algo(id, name) VALUES (0, 'sha256');
 INSERT OR IGNORE INTO ext(id, name) VALUES (0, '');
 "#;
+
+/// Read a size list: `size<TAB>path` per line. Lines that are not are skipped.
+fn read_sizes(path: &Path) -> Result<HashMap<Vec<u8>, u64>> {
+    let (mut lines, _) = LineReader::new(File::open(path)?)?;
+    let mut out = HashMap::new();
+    while let Some((_, l)) = lines.next_line()? {
+        let Some(tab) = l.iter().position(|&b| b == b'\t') else { continue };
+        let Ok(n) = std::str::from_utf8(&l[..tab]).map(str::trim) else { continue };
+        if let Ok(size) = n.parse::<u64>() {
+            let p = &l[tab + 1..];
+            out.insert(p.strip_prefix(b"./").unwrap_or(p).to_vec(), size);
+        }
+    }
+    Ok(out)
+}
 
 /// An open DupeMap database.
 pub struct Db {
@@ -145,7 +163,8 @@ pub struct FileRecord {
     pub dir_id: i64,
     pub name: String,
     pub raw: Option<Vec<u8>>,
-    pub size: u64,
+    /// `None` when the list it came from had no size.
+    pub size: Option<u64>,
     pub digest: Digest,
     pub shadowed_by: Option<i64>,
 }
@@ -225,15 +244,25 @@ impl Db {
 
     /// Import a manifest file. `progress` returns `false` to cancel (nothing is kept).
     pub fn import_file(&mut self, path: &Path, progress: &mut dyn FnMut(Progress) -> bool) -> Result<ImportReport> {
+        self.import_file_as(path, &ImportAs::Manifest, progress)
+    }
+
+    /// Import a manifest or a checksum list.
+    pub fn import_file_as(
+        &mut self,
+        path: &Path,
+        how: &ImportAs,
+        progress: &mut dyn FnMut(Progress) -> bool,
+    ) -> Result<ImportReport> {
         let f = File::open(path)?;
         let meta = f.metadata()?;
         let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
         let name =
             path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-        self.import_reader(&name, &path.display().to_string(), meta.len(), mtime, f, progress)
+        self.import_reader_as(&name, &path.display().to_string(), meta.len(), mtime, f, how, progress)
     }
 
-    /// Import from any reader (used by `import_file` and by tests).
+    /// Import a manifest from any reader (used by `import_file` and by tests).
     pub fn import_reader(
         &mut self,
         file_name: &str,
@@ -243,7 +272,35 @@ impl Db {
         reader: impl Read,
         progress: &mut dyn FnMut(Progress) -> bool,
     ) -> Result<ImportReport> {
+        self.import_reader_as(file_name, file_path, file_size, file_mtime, reader, &ImportAs::Manifest, progress)
+    }
+
+    /// Import a manifest or a checksum list from any reader.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_reader_as(
+        &mut self,
+        file_name: &str,
+        file_path: &str,
+        file_size: u64,
+        file_mtime: Option<i64>,
+        reader: impl Read,
+        how: &ImportAs,
+        progress: &mut dyn FnMut(Progress) -> bool,
+    ) -> Result<ImportReport> {
         let started = Instant::now();
+        let checksums = match how {
+            ImportAs::Manifest => None,
+            ImportAs::Checksums(c) => {
+                if c.host.trim().is_empty() {
+                    return err("a checksum list needs a source name");
+                }
+                let sizes = match &c.sizes {
+                    Some(p) => Some(read_sizes(p).map_err(|e| Error::Msg(format!("size list {}: {e}", p.display())))?),
+                    None => None,
+                };
+                Some((c, sizes))
+            }
+        };
         let (counting, counter) = Counting::new(reader);
         let (mut lines, encoding) = LineReader::new(counting)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -262,6 +319,10 @@ impl Db {
         imp.report.file_path = file_path.to_string();
         imp.report.file_size = file_size;
         imp.report.encoding = encoding.label().to_string();
+        if let Some((c, sizes)) = &checksums {
+            imp.report.checksums = Some((*c).clone());
+            imp.report.size_list_entries = sizes.as_ref().map(|m| m.len() as u64);
+        }
 
         let mut first = true;
         while let Some((line_no, line)) = lines.next_line()? {
@@ -277,9 +338,29 @@ impl Db {
                 imp.report.blank_lines += 1;
                 continue;
             }
-            match parse_row(line) {
-                Ok(row) => imp.add_row(line_no, row, line)?,
-                Err(m) => imp.malformed(line_no, m, line),
+            match &checksums {
+                None => match parse_row(line) {
+                    Ok(row) => imp.add_row(line_no, row, line)?,
+                    Err(m) => imp.malformed(line_no, m, line),
+                },
+                Some((c, sizes)) => match parse_checksum_line(line) {
+                    Ok(cl) => {
+                        let size = sizes.as_ref().and_then(|m| m.get(cl.path.as_ref()).copied());
+                        if size.is_some() {
+                            imp.report.sizes_from_list += 1;
+                        }
+                        let full = c.full_path(&cl.path);
+                        let row = Row {
+                            digest: cl.digest,
+                            prefixed_sha256: false,
+                            size,
+                            host: Cow::Borrowed(c.host.trim()),
+                            path: &full,
+                        };
+                        imp.add_row(line_no, row, line)?
+                    }
+                    Err(m) => imp.malformed(line_no, m, line),
+                },
             }
             let done = imp.report.rows_imported + imp.report.malformed_total();
             if done % 20_000 == 0
@@ -339,16 +420,16 @@ impl Db {
         tx.execute_batch("DROP TABLE IF EXISTS temp.restore_rows; DROP TABLE IF EXISTS temp.restore_cand;")?;
         tx.execute(
             "CREATE TEMP TABLE restore_rows AS
-             SELECT id, manifest_id, dir_id, ifnull(name_key, name) AS k, (algo_id = 0) AS sha
+             SELECT id, manifest_id, dir_id, ifnull(name_key, name) AS k, (algo_id = 0) AS sha, (size >= 0) AS sized
              FROM file WHERE shadowed_by = ?1 AND manifest_id <> ?1",
             [mid],
         )?;
         tx.execute(
             "CREATE TEMP TABLE restore_cand AS
              SELECT c.*, m.scan_time FROM (
-                 SELECT id, manifest_id, dir_id, k, sha, 1 AS restore FROM temp.restore_rows
+                 SELECT id, manifest_id, dir_id, k, sha, sized, 1 AS restore FROM temp.restore_rows
                  UNION ALL
-                 SELECT f.id, f.manifest_id, f.dir_id, ifnull(f.name_key, f.name), (f.algo_id = 0), 0
+                 SELECT f.id, f.manifest_id, f.dir_id, ifnull(f.name_key, f.name), (f.algo_id = 0), (f.size >= 0), 0
                  FROM file f JOIN (SELECT DISTINCT dir_id, k FROM temp.restore_rows) rk
                    ON f.dir_id = rk.dir_id AND ifnull(f.name_key, f.name) = rk.k
                  WHERE f.shadowed_by IS NULL AND f.manifest_id <> ?1
@@ -359,7 +440,7 @@ impl Db {
             "UPDATE file SET shadowed_by = CASE WHEN ranked.manifest_id = ranked.win THEN NULL ELSE ranked.win END
              FROM (SELECT id, manifest_id, restore,
                           first_value(manifest_id) OVER (PARTITION BY dir_id, k
-                                                         ORDER BY sha DESC, scan_time DESC, manifest_id DESC) AS win
+                                                         ORDER BY sha DESC, sized DESC, scan_time DESC, manifest_id DESC) AS win
                    FROM temp.restore_cand) AS ranked
              WHERE file.id = ranked.id AND ranked.restore = 1;",
         )?;
@@ -498,7 +579,7 @@ impl Db {
                     dir_id: r.get(3)?,
                     name: r.get(4)?,
                     raw: r.get(5)?,
-                    size: r.get::<_, i64>(6)? as u64,
+                    size: u64::try_from(r.get::<_, i64>(6)?).ok(),
                     digest: Digest::Sha256([0; 32]),
                     shadowed_by: r.get(9)?,
                 },
@@ -777,7 +858,8 @@ impl<'t> Importer<'t> {
         let ext_id = self.ext_id(&paths::extension(&fname.text))?;
         let is_sha = row.digest.is_sha256();
         let digest = row.digest.db_bytes();
-        let size = row.size as i64;
+        // -1: not known (a checksum list without a size list)
+        let size = row.size.map(|s| s as i64).unwrap_or(-1);
 
         // Other visible listings of the same path decide which one is shown.
         let existing: Vec<(i64, i64, i64, i64, Vec<u8>)> = {
@@ -805,7 +887,8 @@ impl<'t> Importer<'t> {
             }
             let ov = self.overlaps.entry(emid).or_insert_with(|| Overlap { manifest_id: emid, ..Default::default() });
             ov.paths += 1;
-            if !(esize == size && ealgo == algo_id && edigest == digest) {
+            let same_size = esize == size || esize < 0 || size < 0;
+            if !(same_size && ealgo == algo_id && edigest == digest) {
                 ov.changed += 1;
             }
             let e_scan = match self.scan_times.get(&emid) {
@@ -818,7 +901,10 @@ impl<'t> Importer<'t> {
                 }
             };
             let e_sha = ealgo == ALGO_SHA256;
-            let new_wins = (is_sha && !e_sha) || (is_sha == e_sha && self.scan_time >= e_scan);
+            // SHA-256 first, then a listing with a size, then the newer scan
+            let (sized, e_sized) = (size >= 0, esize >= 0);
+            let new_wins = (is_sha && !e_sha)
+                || (is_sha == e_sha && ((sized && !e_sized) || (sized == e_sized && self.scan_time >= e_scan)));
             let ov = self.overlaps.get_mut(&emid).expect("overlap entry");
             if new_wins {
                 self.tx
@@ -855,7 +941,10 @@ impl<'t> Importer<'t> {
             ])?;
 
         self.report.rows_imported += 1;
-        self.report.bytes_total += row.size;
+        match row.size {
+            Some(s) => self.report.bytes_total += s,
+            None => self.report.rows_unknown_size += 1,
+        }
         *self.report.hosts.entry(row.host.into_owned()).or_insert(0) += 1;
         if is_sha {
             self.report.rows_sha256 += 1;
@@ -1178,6 +1267,116 @@ mod tests {
         }
         assert!(Db::open(&p).is_err(), "a database from a newer DupeMap is not touched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn import_checksums(db: &mut Db, name: &str, body: &str, host: &str, base: &str) -> ImportReport {
+        let how = ImportAs::Checksums(ChecksumImport { host: host.into(), base: base.into(), sizes: None });
+        db.import_reader_as(name, name, body.len() as u64, None, body.as_bytes(), &how, &mut |_| true).unwrap()
+    }
+
+    fn size_of(db: &Db, name: &str) -> Vec<i64> {
+        let mut st =
+            db.conn.prepare("SELECT size FROM file WHERE name = ?1 AND shadowed_by IS NULL ORDER BY id").unwrap();
+        st.query_map([name], |r| r.get(0)).unwrap().collect::<rusqlite::Result<Vec<i64>>>().unwrap()
+    }
+
+    #[test]
+    fn checksum_list_rows_have_no_size_and_the_given_source() {
+        let mut db = Db::open_in_memory().unwrap();
+        let body = format!("{A}  Docs/a.pdf\n{B} *b.bin\nERROR                  broken.bin\nnot a line\n");
+        let r = import_checksums(&mut db, "onedrive-hashsum.txt", &body, "onedrive:", "onedrive:");
+        assert_eq!(r.rows_imported, 2);
+        assert_eq!(r.rows_unknown_size, 2);
+        assert_eq!(r.malformed.get("no hash (rclone could not read the file)"), Some(&1));
+        assert_eq!(r.malformed.get("not a checksum line"), Some(&1));
+        assert!(r.is_checksum_list());
+        assert!(!r.header_found);
+        // malformed lines are an alert; a clean checksum list is only a notice (no sizes)
+        assert_eq!(r.severity(), Severity::Alert);
+        assert!(r.findings().iter().all(|f| !f.contains("header line")), "no header is expected");
+        let clean = import_checksums(&mut db, "clean.txt", &format!("{C}  c.bin\n"), "onedrive:", "onedrive:");
+        assert_eq!(clean.severity(), Severity::Notice);
+        assert_eq!(size_of(&db, "a.pdf"), [-1]);
+        let srcs = db.sources().unwrap();
+        assert_eq!(srcs.len(), 1);
+        assert_eq!(srcs[0].host, "onedrive:");
+        assert_eq!(srcs[0].kind, PathKind::Cloud);
+        let rec = db.file_record(1).unwrap();
+        assert_eq!(rec.size, None);
+    }
+
+    #[test]
+    fn a_size_list_fills_in_sizes() {
+        let dir = std::env::temp_dir().join(format!("dupemap-sizes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sizes = dir.join("onedrive-sizes.tsv");
+        // what rclone lsf --format sp --separator "\t" writes (the script saves it with a BOM)
+        std::fs::write(&sizes, "\u{FEFF}1048576\tDocs/a.pdf\r\n2000000\tother.bin\r\n").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let how = ImportAs::Checksums(ChecksumImport {
+            host: "onedrive:".into(),
+            base: "onedrive:".into(),
+            sizes: Some(sizes.clone()),
+        });
+        let body = format!("{A}  Docs/a.pdf\n{B}  b.bin\n");
+        let r = db.import_reader_as("x.txt", "x.txt", 0, None, body.as_bytes(), &how, &mut |_| true).unwrap();
+        assert_eq!(r.size_list_entries, Some(2));
+        assert_eq!(r.sizes_from_list, 1);
+        assert_eq!(r.rows_unknown_size, 1);
+        assert_eq!(r.bytes_total, 1048576);
+        assert_eq!(size_of(&db, "a.pdf"), [1048576]);
+        assert_eq!(size_of(&db, "b.bin"), [-1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listing_with_a_size_beats_one_without() {
+        let mut db = Db::open_in_memory().unwrap();
+        // the manifest with sizes is older, but it still wins over the newer checksum list
+        let t_old = format!("{HEADER}\n{A}\t7\tonedrive:\tonedrive:/Docs/a.pdf\n");
+        db.import_reader("m.tsv", "m.tsv", 0, Some(1_000), t_old.as_bytes(), &mut |_| true).unwrap();
+        let how =
+            ImportAs::Checksums(ChecksumImport { host: "onedrive:".into(), base: "onedrive:".into(), sizes: None });
+        let body = format!("{A}  Docs/a.pdf\n");
+        let r = db.import_reader_as("c.txt", "c.txt", 0, Some(2_000), body.as_bytes(), &how, &mut |_| true).unwrap();
+        assert_eq!(r.overlaps.len(), 1);
+        assert_eq!((r.overlaps[0].changed, r.overlaps[0].this_shown, r.overlaps[0].other_shown), (0, 0, 1));
+        assert_eq!(size_of(&db, "a.pdf"), [7]);
+        // removing the manifest shows the checksum listing again
+        db.remove_manifest(1).unwrap();
+        assert_eq!(size_of(&db, "a.pdf"), [-1]);
+        // and importing it again hides the checksum listing once more
+        db.import_reader("m2.tsv", "m2.tsv", 0, Some(1_000), t_old.as_bytes(), &mut |_| true).unwrap();
+        assert_eq!(size_of(&db, "a.pdf"), [7]);
+        // removal ranking: with three listings, the sized one is restored first
+        let t3 = format!("{HEADER}\n{A}\t7\tonedrive:\tonedrive:/Docs/a.pdf\n");
+        db.import_reader("m3.tsv", "m3.tsv", 0, Some(3_000), t3.as_bytes(), &mut |_| true).unwrap();
+        let m3 = db.manifest_by_name("m3.tsv").unwrap().unwrap().id;
+        db.remove_manifest(m3).unwrap();
+        assert_eq!(size_of(&db, "a.pdf"), [7], "m2 (sized) is shown again, not the checksum list");
+    }
+
+    #[test]
+    fn checksum_paths_are_joined_to_the_base() {
+        let c = |base: &str, p: &str| {
+            let ci = ChecksumImport { host: "h".into(), base: base.into(), sizes: None };
+            String::from_utf8(ci.full_path(p.as_bytes()).into_owned()).unwrap()
+        };
+        assert_eq!(c("onedrive:", "Docs/a.pdf"), "onedrive:Docs/a.pdf");
+        assert_eq!(c("onedrive:/", "./Docs/a.pdf"), "onedrive:/Docs/a.pdf");
+        assert_eq!(c("/mnt/tank", "Docs/a.pdf"), "/mnt/tank/Docs/a.pdf");
+        assert_eq!(c("/mnt/tank/", "/abs/x"), "/abs/x", "absolute paths stay");
+        assert_eq!(c(r"D:\Photos", "2019/a.jpg"), r"D:\Photos\2019\a.jpg");
+        assert_eq!(c(r"\\nas\share", "a/b.jpg"), r"\\nas\share\a\b.jpg");
+        assert_eq!(c("", "Docs/a.pdf"), "Docs/a.pdf");
+        assert_eq!(c("x:", "gdrive:a.pdf"), "gdrive:a.pdf", "a remote path stays");
+    }
+
+    #[test]
+    fn a_checksum_list_needs_a_source() {
+        let mut db = Db::open_in_memory().unwrap();
+        let how = ImportAs::Checksums(ChecksumImport { host: " ".into(), base: String::new(), sizes: None });
+        assert!(db.import_reader_as("x", "x", 0, None, &b""[..], &how, &mut |_| true).is_err());
     }
 
     #[test]

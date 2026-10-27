@@ -1,6 +1,7 @@
 //! Import reports: everything noteworthy about one manifest import, persisted as JSON with the
 //! manifest so alerts survive restarts.
 
+use crate::manifest::ChecksumImport;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -93,6 +94,19 @@ pub struct ImportReport {
     pub bytes_total: u64,
     pub samples: Vec<Sample>,
     pub elapsed_ms: u64,
+    /// Set when the file was imported as a checksum list (`hash  path`): the source and base
+    /// folder it was given (kept to re-import it the same way).
+    #[serde(default)]
+    pub checksums: Option<ChecksumImport>,
+    /// Rows stored without a size (a checksum list without, or not covered by, a size list).
+    #[serde(default)]
+    pub rows_unknown_size: u64,
+    /// Entries in the size list given with a checksum list.
+    #[serde(default)]
+    pub size_list_entries: Option<u64>,
+    /// Rows whose size came from that size list.
+    #[serde(default)]
+    pub sizes_from_list: u64,
 }
 
 impl ImportReport {
@@ -104,14 +118,21 @@ impl ImportReport {
         self.malformed.values().sum()
     }
 
+    /// Imported as a checksum list (no header, no sizes, the source given at import).
+    pub fn is_checksum_list(&self) -> bool {
+        self.checksums.is_some()
+    }
+
     pub fn severity(&self) -> Severity {
-        if self.flagged_total() > 0 || self.malformed_total() > 0 || !self.header_found {
+        let missing_header = !self.header_found && !self.is_checksum_list();
+        if self.flagged_total() > 0 || self.malformed_total() > 0 || missing_header {
             Severity::Alert
         } else if self.duplicate_listings > 0
             || self.same_path_cloud > 0
             || !self.overlaps.is_empty()
             || !self.mixed_kinds.is_empty()
             || self.non_utf8_paths > 0
+            || self.rows_unknown_size > 0
         {
             Severity::Notice
         } else {
@@ -135,10 +156,35 @@ impl ImportReport {
             let by: Vec<String> = self.malformed.iter().map(|(a, n)| format!("{a}: {n}")).collect();
             out.push(format!("ALERT: {mal} malformed line(s) skipped ({}).", by.join(", ")));
         }
-        if !self.header_found {
+        if !self.header_found && !self.is_checksum_list() {
             out.push(
                 "ALERT: header line \"hash<TAB>size<TAB>host<TAB>path\" not found; is this a DupeMap manifest?".into(),
             );
+        }
+        if let Some(c) = &self.checksums {
+            let mut s = format!(
+                "Checksum list (hash and path only): every row belongs to source \"{}\"{}.",
+                c.host,
+                if c.base.is_empty() { String::new() } else { format!(", relative paths start at {}", c.base) }
+            );
+            if let Some(n) = self.size_list_entries {
+                s.push_str(&format!(
+                    " Sizes from {} ({n} entries): {} row(s) found there.",
+                    c.sizes
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    self.sizes_from_list
+                ));
+            }
+            out.push(s);
+        }
+        if self.rows_unknown_size > 0 {
+            out.push(format!(
+                "{} row(s) have no size. A file whose SHA-256 is also listed with a size elsewhere takes that size; the others show their size as unknown and count as 0 bytes in totals.",
+                self.rows_unknown_size
+            ));
         }
         if self.duplicate_listings > 0 {
             out.push(format!(

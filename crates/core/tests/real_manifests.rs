@@ -52,7 +52,7 @@ fn real_manifests_round_trip() {
             }
             let row = parse_row(line).unwrap();
             let canonical = parse_path(row.path).display();
-            raw.insert((row.host.to_string(), canonical), (row.digest.display(), row.size));
+            raw.insert((row.host.to_string(), canonical), (row.digest.display(), row.size.unwrap_or(0)));
         }
     }
 
