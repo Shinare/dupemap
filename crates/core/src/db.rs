@@ -450,6 +450,16 @@ impl Db {
         self.set_setting("ignore", s)
     }
 
+    /// The file-type categories for summaries (the built-in ones until edited).
+    pub fn categories(&self) -> Result<crate::summary::Categories> {
+        Ok(self.setting::<crate::summary::Categories>("categories")?.unwrap_or_default())
+    }
+
+    /// Store edited categories (cleaned up first).
+    pub fn set_categories(&self, c: &crate::summary::Categories) -> Result<()> {
+        self.set_setting("categories", &c.normalized())
+    }
+
     pub fn set_alert_dismissed(&self, mid: i64, dismissed: bool) -> Result<()> {
         self.conn.execute("UPDATE manifest SET alert_dismissed = ?1 WHERE id = ?2", params![dismissed as i64, mid])?;
         Ok(())

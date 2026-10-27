@@ -937,6 +937,27 @@ impl Index {
         self.exts.get(self.file_ext[f as usize] as usize).map(String::as_str).unwrap_or("")
     }
 
+    /// The interned extension id of a file (see [`Index::ext_name`]).
+    pub fn file_ext_id(&self, f: FileIx) -> u32 {
+        self.file_ext[f as usize]
+    }
+
+    /// Number of interned extension ids (`0..ext_count()`).
+    pub fn ext_count(&self) -> usize {
+        self.exts.len()
+    }
+
+    /// An interned extension: lower-case, without the dot, `""` for none.
+    pub fn ext_name(&self, e: u32) -> &str {
+        self.exts.get(e as usize).map(String::as_str).unwrap_or("")
+    }
+
+    /// (copies anywhere, number of sources holding one) of a content.
+    pub fn copy_spread(&self, c: ContentIx) -> (u32, u16) {
+        let h = &self.hot[c as usize];
+        (h.copies, h.src_len)
+    }
+
     pub fn file_flagged(&self, f: FileIx) -> bool {
         self.hot[self.file_content[f as usize] as usize].algo != ALGO_SHA256 as u16
     }

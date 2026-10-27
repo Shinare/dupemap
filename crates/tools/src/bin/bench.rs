@@ -243,6 +243,17 @@ fn main() {
         format!("{:.1} ms ({} files)", slowest.0, slowest.1),
     );
 
+    // the summary tab: every source, then the biggest one
+    let cats = dupemap_core::summary::Categories::default();
+    let s = Instant::now();
+    let all = ix.summary(None, &cats);
+    t.ms(&format!("summary by file type, all sources ({} extensions)", all.exts.len()), s);
+    if let Some(big) = ix.source_summaries().iter().max_by_key(|s| s.files) {
+        let s = Instant::now();
+        let _ = ix.summary(Some(big.source), &cats);
+        t.ms(&format!("summary by file type, biggest source ({} files)", big.files), s);
+    }
+
     drop(ix);
     drop(db);
     let mut db = Db::open(&db_path).unwrap();
