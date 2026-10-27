@@ -628,21 +628,7 @@ impl TreePane {
                 } else {
                     Pos2::new(text_rect.right() + 9.0, rect.center().y)
                 };
-                let s = 3.5;
-                let pts = if self.opts.descending {
-                    vec![
-                        Pos2::new(c.x - s, c.y - s * 0.6),
-                        Pos2::new(c.x + s, c.y - s * 0.6),
-                        Pos2::new(c.x, c.y + s * 0.7),
-                    ]
-                } else {
-                    vec![
-                        Pos2::new(c.x - s, c.y + s * 0.6),
-                        Pos2::new(c.x + s, c.y + s * 0.6),
-                        Pos2::new(c.x, c.y - s * 0.7),
-                    ]
-                };
-                p.add(egui::Shape::convex_polygon(pts, colors::INK_SECONDARY, Stroke::NONE));
+                widgets::sort_arrow(&p, c, self.opts.descending, colors::INK_SECONDARY);
             }
             let resp = resp.on_hover_text(tip);
             if resp.clicked() {
@@ -943,6 +929,10 @@ impl TreePane {
         }
         ui.separator();
         if is_source {
+            if ui.button("Summary by file type").on_hover_text("What kinds of files this source holds").clicked() {
+                cx.actions.push(Action::OpenSummary(Root::Source(source.db_id)));
+                ui.close();
+            }
             if ui.button("Open in new tab").clicked() {
                 cx.actions.push(Action::NewTab(Root::Source(source.db_id)));
                 ui.close();

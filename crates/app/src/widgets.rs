@@ -127,6 +127,17 @@ pub fn status_label(ui: &mut Ui, icon: &str, color: Color32, text: impl Into<Str
     .response
 }
 
+/// A small triangle beside a sorted column's title: down for descending, up for ascending.
+pub fn sort_arrow(painter: &Painter, c: Pos2, descending: bool, color: Color32) {
+    let s = 3.5;
+    let pts = if descending {
+        vec![Pos2::new(c.x - s, c.y - s * 0.6), Pos2::new(c.x + s, c.y - s * 0.6), Pos2::new(c.x, c.y + s * 0.7)]
+    } else {
+        vec![Pos2::new(c.x - s, c.y + s * 0.6), Pos2::new(c.x + s, c.y + s * 0.6), Pos2::new(c.x, c.y - s * 0.7)]
+    };
+    painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
 /// The expand/collapse triangle.
 pub fn expander(painter: &Painter, rect: Rect, open: bool, color: Color32) {
     let c = rect.center();

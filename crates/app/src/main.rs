@@ -8,6 +8,7 @@
 
 mod actions;
 mod app;
+mod categories_ui;
 mod colors;
 mod files;
 mod fonts;
@@ -19,6 +20,7 @@ mod manifests_ui;
 mod pane;
 mod selection;
 mod shot;
+mod summary_ui;
 mod theme;
 mod tree;
 mod widgets;

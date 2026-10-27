@@ -8,8 +8,13 @@ use dupemap_core::synth::{generate, Config, Rng};
 use dupemap_core::Db;
 use std::collections::{HashMap, HashSet};
 
-/// (source db id, size, ext, content key) of every visible row.
-fn rows(db: &Db) -> Vec<(i64, u64, String, (i64, Vec<u8>, u64))> {
+/// algo, digest, size
+type Key = (i64, Vec<u8>, u64);
+/// source db id, size, extension, content key
+type Row = (i64, u64, String, Key);
+
+/// Every visible row.
+fn rows(db: &Db) -> Vec<Row> {
     let c = db.conn();
     let mut st = c
         .prepare(
@@ -48,7 +53,7 @@ fn add(s: &mut Split, kind: u8, size: u64) {
 fn check(db: &Db, cats: &Categories) -> usize {
     let ix = Index::build_with(db, &IgnoreSettings::disabled(), &mut |_, _| {}).unwrap();
     let rows = rows(db);
-    let mut groups: HashMap<&(i64, Vec<u8>, u64), (u32, HashSet<i64>)> = HashMap::new();
+    let mut groups: HashMap<&Key, (u32, HashSet<i64>)> = HashMap::new();
     for (src, _, _, key) in &rows {
         let g = groups.entry(key).or_default();
         g.0 += 1;

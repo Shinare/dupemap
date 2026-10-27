@@ -12,6 +12,7 @@ use dupemap_core::index::{
     DirIx, DirStats, DupGroup, DupQuery, FileIx, FileRow, Filter, Index, ListOptions, Location, Node, OutsideCopies,
 };
 use dupemap_core::natsort::natural_cmp;
+use dupemap_core::summary::{Categories, Summary};
 use dupemap_core::{Db, Error, ImportReport, Severity};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,16 @@ pub enum Query {
         page: usize,
         totals: bool,
     },
+    /// Totals by file type for one source (database id) or all of them.
+    Summary {
+        generation: u64,
+        scope: Option<i64>,
+        categories: Arc<Categories>,
+        /// Which version of the categories this is (replies for older ones are dropped).
+        version: u64,
+    },
+    /// Store edited categories.
+    SetCategories(Categories),
 }
 
 /// Rows per page of duplicate groups.
@@ -129,6 +140,14 @@ pub enum Reply {
         totals: Option<(usize, u64)>,
         rows: Result<Arc<Vec<GroupRow>>, String>,
     },
+    Summary {
+        generation: u64,
+        scope: Option<i64>,
+        version: u64,
+        summary: Arc<Summary>,
+    },
+    /// The categories as stored (cleaned up), or why they could not be.
+    Categories(Result<Categories, String>),
 }
 
 pub struct Worker {
@@ -210,6 +229,27 @@ impl Worker {
                                     .map(Arc::new)
                                     .map_err(|e| e.to_string());
                                 let _ = rtx.send(Reply::Groups { generation, query, page, total, totals, rows });
+                                repaint();
+                            }
+                            Query::Summary { generation, scope, categories, version } => {
+                                let Some((g, ix, _, _)) = &state else { continue };
+                                if *g != generation {
+                                    continue;
+                                }
+                                // a source that is gone summarises as nothing
+                                let summary = match scope.map(|id| ix.source_ix(id)) {
+                                    Some(None) => Summary::empty(&categories),
+                                    Some(Some(s)) => ix.summary(Some(s), &categories),
+                                    None => ix.summary(None, &categories),
+                                };
+                                let summary = Arc::new(summary);
+                                let _ = rtx.send(Reply::Summary { generation, scope, version, summary });
+                                repaint();
+                            }
+                            Query::SetCategories(c) => {
+                                let Some((_, _, db, _)) = &state else { continue };
+                                let r = db.set_categories(&c).and_then(|_| db.categories()).map_err(|e| e.to_string());
+                                let _ = rtx.send(Reply::Categories(r));
                                 repaint();
                             }
                             Query::SetAlertDismissed { manifest_id, dismissed } => {
@@ -318,6 +358,8 @@ pub struct JobProgress {
 pub struct JobOutcome {
     pub index: Option<Arc<Index>>,
     pub manifests: Vec<ManifestInfo>,
+    /// The file-type categories stored in the database.
+    pub categories: Option<Categories>,
     /// Sources of manifests whose alerts were not dismissed.
     pub alert_hosts: BTreeSet<String>,
     pub reports: Vec<ImportReport>,
@@ -450,6 +492,7 @@ fn run(db_path: &Path, job: Job, p: &Mutex<JobProgress>, cancel: &AtomicBool, re
     }
     out.manifests = db.manifests().unwrap_or_default();
     out.alert_hosts = alert_hosts(&db, &out.manifests);
+    out.categories = db.categories().ok();
     // always end with an index of whatever the database now holds
     set(p, "Building index", 0.0, repaint);
     match Index::build_with_progress(&db, &mut |stage, f| set(p, format!("Building index: {stage}"), f, repaint)) {

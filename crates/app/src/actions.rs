@@ -38,6 +38,12 @@ pub enum Action {
     OpenGroups,
     ToggleInspector,
     OpenInspector,
+    /// Open a summary tab for one source or all of them (or switch to one already open).
+    OpenSummary(Root),
+    /// Open the category editor.
+    OpenCategories,
+    /// Store new file-type categories.
+    SetCategories(dupemap_core::summary::Categories),
 }
 
 /// Whether a manifest host names this computer ("PC1" or "PC1 D: (Media)" on PC1).

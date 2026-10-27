@@ -213,6 +213,15 @@ pub struct Summary {
     pub sources: Vec<(SourceIx, Split)>,
 }
 
+impl Summary {
+    /// A summary of nothing (for a source that no longer exists).
+    pub fn empty(cats: &Categories) -> Summary {
+        let names = cats.names();
+        let categories = vec![Split::default(); names.len()];
+        Summary { scope: None, total: Split::default(), names, categories, exts: Vec::new(), sources: Vec::new() }
+    }
+}
+
 impl Index {
     /// Totals by category, extension and source for one source (`Some`) or every source.
     pub fn summary(&self, scope: Option<SourceIx>, cats: &Categories) -> Summary {
