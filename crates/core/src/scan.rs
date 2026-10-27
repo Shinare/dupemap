@@ -712,6 +712,13 @@ pub fn list_volumes() -> Vec<Volume> {
     platform::list_volumes()
 }
 
+/// Linux: is a mounted file system one that holds no user files (system folders mounted on their
+/// own, TrueNAS's boot pool and system dataset, app data)? The scan script skips the same.
+#[cfg(unix)]
+pub fn skip_mount(source: &str, target: &str) -> bool {
+    platform::skip_mount(source, target)
+}
+
 /// This computer's name as the scripts write it (`COMPUTERNAME` on Windows, the host name on
 /// Linux).
 pub fn computer_name() -> String {
@@ -1213,6 +1220,23 @@ mod platform {
         (None, None)
     }
 
+    /// Mounts that hold no user files: system folders mounted on their own (`/usr`, `/var`…), TrueNAS's
+    /// boot pool (`/`, `/usr`, `/var/log`, `/conf`… are datasets of `boot-pool`), its `.system`
+    /// dataset and app data, and hidden datasets. The scan script skips the same.
+    pub fn skip_mount(dev: &str, target: &str) -> bool {
+        const SYSTEM: [&str; 11] =
+            ["/boot", "/snap", "/proc", "/sys", "/dev", "/efi", "/recovery", "/usr", "/var", "/etc", "/run/user"];
+        if SYSTEM.iter().any(|p| target == *p || target.starts_with(&format!("{p}/"))) {
+            return true;
+        }
+        if target.split('/').any(|c| c.starts_with('.') && c.len() > 1) || target.contains("ix-applications") {
+            return true;
+        }
+        dev.starts_with("boot-pool/")
+            || dev.starts_with("freenas-boot/")
+            || dev.split('/').any(|c| c == ".system" || c == ".ix-apps" || c == "ix-applications")
+    }
+
     pub fn list_volumes() -> Vec<Volume> {
         let host = computer_name();
         let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
@@ -1232,12 +1256,7 @@ mod platform {
             } else {
                 continue;
             };
-            let skip = ["/boot", "/snap", "/proc", "/sys", "/dev", "/efi", "/recovery", "/var/lib", "/run/user"];
-            if skip.iter().any(|p| target == *p || target.starts_with(&format!("{p}/"))) {
-                continue;
-            }
-            // TrueNAS app data and hidden datasets
-            if target.split('/').any(|c| c.starts_with('.') && c.len() > 1) || target.contains("ix-applications") {
+            if skip_mount(dev, &target) {
                 continue;
             }
             if out.iter().any(|v| v.root == Path::new(&target)) {
@@ -1340,6 +1359,42 @@ mod tests {
 
     fn settings() -> ScanSettings {
         ScanSettings { min_size: 100_000, ..Default::default() }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_mounts_and_truenas_internals_are_not_offered() {
+        use super::platform::skip_mount;
+        let skipped = [
+            ("boot-pool/ROOT/24.10.2", "/"),
+            ("boot-pool/ROOT/24.10.2/usr", "/usr"),
+            ("boot-pool/ROOT/24.10.2/conf", "/conf"),
+            ("boot-pool/ROOT/24.10.2/var/log", "/var/log"),
+            ("freenas-boot/ROOT/default", "/"),
+            ("tank/.system", "/var/db/system"),
+            ("tank/.system/cores", "/var/db/system/cores"),
+            ("tank/ix-applications", "/mnt/tank/ix-applications"),
+            ("tank/.ix-apps", "/mnt/.ix-apps"),
+            ("/dev/sdb1", "/var"),
+            ("/dev/sdb2", "/usr/local"),
+            ("/dev/sda1", "/boot/efi"),
+        ];
+        for (dev, target) in skipped {
+            assert!(skip_mount(dev, target), "{dev} on {target} should be skipped");
+        }
+        let kept = [
+            ("tank", "/mnt/tank"),
+            ("tank/media", "/mnt/tank/media"),
+            ("backup/photos", "/mnt/backup/photos"),
+            ("/dev/sda2", "/"),
+            ("/dev/sda3", "/home"),
+            ("/dev/sdc1", "/media/user/USB DISK"),
+            ("//nas/share", "/mnt/share"),
+            ("rpool/ROOT/ubuntu_x", "/"),
+        ];
+        for (dev, target) in kept {
+            assert!(!skip_mount(dev, target), "{dev} on {target} should be offered");
+        }
     }
 
     #[test]

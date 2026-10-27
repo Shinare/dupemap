@@ -4,16 +4,18 @@ Custom cross-machine duplicate file comparator based on hashes.
 
 Explore and compare file-hash manifests from several machines, find duplicates, and (later
 phases) export delete scripts. Windows desktop app in Rust. Done so far: the test-data generator,
-the core library with three command-line tools (Phases 0–1), the app shell (Phase 2), the
-compare features: inspector, linked highlighting, filters and duplicate groups (Phase 3), and the
-summary by file type with editable categories (Phase 4).
+the core library with command-line tools (Phases 0–1), the app shell (Phase 2), the compare
+features: inspector, linked highlighting, filters and duplicate groups (Phase 3), the summary by
+file type with editable categories (Phase 4), the saved session (Phase 5), and: scanning this PC
+from the app, scan scripts for other computers, search by name or hash, and importing checksum
+lists (`sha256sum` / `rclone hashsum` output).
 
 ## Layout
 
 | path | what |
 |---|---|
 | `crates/core` | `dupemap-core`: manifest parsing and validation, SQLite storage, the in-memory duplicate index, synthetic data generator. All logic lives here and is unit-tested. |
-| `crates/tools` | `dupemap-gen` (synthetic manifests), `dupemap-check` (import real manifests and print reports), `dupemap-bench` (timings). |
+| `crates/tools` | `dupemap-gen` (synthetic manifests), `dupemap-check` (import real manifests and print reports), `dupemap-scan` (the built-in scan from the command line), `dupemap-bench` (timings). |
 | `crates/app` | `DupeMap.exe`, the desktop app (egui). |
 
 ## Build (Windows)
@@ -36,10 +38,48 @@ Binaries end up in `target\release\`.
 target\release\DupeMap.exe
 ```
 
-* **Import**: File → Import manifests (Ctrl+O), or drop `manifest-*.tsv` files, or a folder of
+* **Scan this PC** (on the start screen, and File → Scan this PC…): tick *This computer's
+  drives*, *USB drives* and/or *Network drives* (each drive can be ticked on its own too) and
+  DupeMap hashes their files one drive after another, the same as the export script would, and
+  imports each drive's manifest as it finishes. Progress, speed and time left are shown; *Stop*
+  keeps what was hashed and the next scan of that drive continues from there (also after a crash
+  or power cut). Without administrator rights, folders only an administrator can read are
+  skipped, so the window offers *Restart as administrator* (Windows asks first; DupeMap opens
+  again with the window). Drive letters mapped in your normal session are not visible to a
+  program run as administrator; DupeMap then reaches those network drives through their share and
+  still writes their paths with the letter. Like the scripts it skips Windows, Program Files,
+  ProgramData, AppData, the recycle bin and (unless you untick it) OneDrive / Google Drive folders,
+  never reads online-only cloud files (that would download them), hashes files of 1 MB and up
+  (adjustable), reads a spinning or USB disk one file at a time and an SSD with up to four, and
+  keeps the computer awake. Manifests go to a `scans` folder beside the database, one per drive
+  (`manifest-<PC>-<letter>.tsv`), with the scripts' source names (`<PC> D: (<label>)`), so a
+  drive scanned here and by a script is one source.
+* **Scan another computer** (start screen, File → Scan another computer…): choose Windows or
+  Linux (TrueNAS SCALE, a Linux PC), the same tick boxes, and save the script. Run it there with
+  administrator rights — on Windows right-click → *Run with PowerShell* (it asks for administrator
+  rights itself), on Linux `sudo bash dupemap-scan-linux.sh` (or with `nohup` for a long run) —
+  and import the manifest it writes. It continues where it stopped when run again. On Linux it
+  scans each file system on its own (ZFS datasets, USB disks by their bus, NFS/SMB shares) and
+  skips `.zfs` snapshots, the system folders of the system disk, TrueNAS's boot pool and system
+  dataset, and app data.
+* **Import**: File → Import manifests (Ctrl+O), or drop manifests, checksum lists, or a folder of
   them, anywhere on the window. Importing a file with the same name replaces the earlier import.
   An import report opens afterwards; alerts (non-SHA-256 hashes, malformed lines) stay visible in
   the status bar and as a ⚠ on the source's tab until you dismiss them (File → Manifests → Report).
+* **Checksum lists** (`hash  path` per line, as `sha256sum` or `rclone hashsum sha256` write them,
+  e.g. the OneDrive file from `rclone hashsum sha256 --download onedrive:`) are recognised and
+  imported after a short question: which source the files are on (guessed from the file name:
+  `onedrive-hashsum.txt` → the rclone remote `onedrive:`) and where its relative paths start. A
+  size list (`size<TAB>path`, as `rclone lsf --format sp` writes it; `onedrive-sizes.tsv` next to
+  the list is picked up by itself) fills in sizes. Without one, a file takes the size of a copy
+  with the same SHA-256 elsewhere; a file with no such copy shows its size as `?` and counts as
+  0 bytes. Re-importing the list uses the same answers.
+* **Search** (View → Search, Ctrl+F): files and folders in every source (or one) by name — part
+  of a name, case and accents ignored (`plaza` finds `Plaża`), or a whole-name pattern with `*`
+  and `?` (`*.mkv`, `IMG_20??.jpg`) — or files by hash: paste a SHA-256 (or type its first
+  digits; `md5:…` for other hashes) to find every copy. Results sort by name, folder, source,
+  size or copies; select one to see it in the inspector, double-click to show it in a tab.
+  Under a second for 5 million files.
 * **Tabs**: every tab shows all sources or one source (the Source box above the table). Add tabs
   with `+` or Ctrl+T, drag a tab to the side of another to split the view, close with ×.
 * **Columns**: *Size* — the bar is the share of the parent folder, its colour the absolute size
@@ -53,8 +93,8 @@ target\release\DupeMap.exe
   A narrow tab (split views, small screens) drops columns to keep the names readable: Files first,
   then Copies, then Elsewhere; the inspector and tooltips still show everything.
 * **Keyboard**: ↑ ↓ PgUp PgDn Home End move, → expands, ← collapses or goes to the parent,
-  Enter toggles, Ctrl+C copies the path. Ctrl+G opens the duplicate groups, Ctrl+U the summary by
-  file type, Ctrl+I shows or hides the inspector.
+  Enter toggles, Ctrl+C copies the path. Ctrl+F searches, Ctrl+G opens the duplicate groups,
+  Ctrl+U the summary by file type, Ctrl+I shows or hides the inspector.
 * **Right-click** a folder or file: copy path or name, show in Explorer (for paths on this PC),
   expand or collapse everything below, **ignore this folder**, *Show every copy* / *Where are the
   copies?* (opens the inspector).
@@ -117,7 +157,9 @@ or remote session without GPU drivers, copy `opengl32.dll` and `libgallium_wgl.d
 The database lives in `%LOCALAPPDATA%\DupeMap\dupemap.db`; `DupeMap.exe --db D:\other.db` uses
 another one. `DupeMap.exe --db C:\tmp\demo.db --demo 1000000` fills a separate database with
 generated demo data, and `--window 1024x768` opens the window at that size (to try small
-screens; it overrides the saved window size). The app reads manifests only; it has no network access and never deletes anything.
+screens; it overrides the saved window size); `--scan` opens *Scan this PC* at start. The app
+only reads files (manifests, and the drives you scan); it has no network access and never deletes
+anything.
 
 ## Try it on your manifests (command line)
 
@@ -130,7 +172,17 @@ It prints, per manifest, the rows imported and any alerts (non-SHA-256 hashes, m
 with line numbers and samples, duplicate listings, overlaps with other manifests), then a
 per-source summary and the biggest duplicate groups with every location. Exit code 1 means at
 least one manifest raised an alert. With `--db` the database is kept; re-running with a
-manifest of the same file name replaces the earlier import.
+manifest of the same file name replaces the earlier import. Checksum lists are recognised;
+`--source onedrive: --base onedrive: --sizes onedrive-sizes.tsv` say where they belong (otherwise
+guessed from the file name).
+
+The built-in scan from the command line:
+
+```
+target\release\dupemap-scan --list                    # drives and how they are classed
+target\release\dupemap-scan --out C:\Hashes D: usb     # D: and every USB drive
+target\release\dupemap-scan --folder E:\Photos --host "PC2 E: (Photos)" --out C:\Hashes
+```
 
 ## Manifest rules
 
@@ -147,11 +199,14 @@ manifest of the same file name replaces the earlier import.
 
 ## How duplicates are counted
 
-* Two files are copies when algorithm, digest and size are all equal.
+* Two files are copies when algorithm, digest and size are all equal. A file from a checksum
+  list has no size: it is a copy of the files with the same algorithm and digest, and takes
+  their size.
 * A path listed twice is one file, never two copies: the same path twice in one manifest
   (overlapping scan folders) keeps one listing; the same path in two manifests (e.g. a USB disk
-  scanned by both Windows scripts) keeps one listing, preferring SHA-256, then the newer scan
-  (manifest file date), then the later import. Removing a manifest restores what it hid.
+  scanned by both Windows scripts) keeps one listing, preferring SHA-256, then a listing with a
+  size (over a checksum list's), then the newer scan (manifest file date), then the later import.
+  Removing a manifest restores what it hid.
   Cloud remotes are the exception: Google Drive allows identical names, so same-path rows there
   stay separate files.
 * For every folder, under any filter: total size, file count, files with another copy anywhere,

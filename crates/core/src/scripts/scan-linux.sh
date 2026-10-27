@@ -22,7 +22,8 @@
 #
 # An interrupted run continues where it stopped when you run it again from the same folder.
 # Each file system is scanned on its own (it does not wander into other mounts); ZFS snapshots
-# (.zfs), /proc, /sys, /usr, /var... of the system disk and TrueNAS app data are skipped.
+# (.zfs), /proc, /sys, /usr, /var... of the system disk, TrueNAS's boot pool and system dataset and
+# its app data are skipped.
 
 set -u
 KINDS=${KINDS:-"@@KINDS@@"}
@@ -51,11 +52,15 @@ else
     case " $KINDS " in *" $kind "*) ;; *) continue ;; esac
     case "$target" in
       /boot|/boot/*|/snap|/snap/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/efi|/efi/*|/recovery|/recovery/*) continue ;;
-      /var/lib|/var/lib/*|/run/user|/run/user/*) continue ;;
+      /usr|/usr/*|/var|/var/*|/etc|/etc/*|/run/user|/run/user/*) continue ;;
       */.*|*ix-applications*) continue ;;   # hidden datasets (TrueNAS app data)
     esac
+    case "$src" in
+      # TrueNAS: the boot pool (/, /usr, /var/log, /conf...), the .system dataset, app data
+      boot-pool/*|freenas-boot/*|*/.system|*/.system/*|*/.ix-apps|*/.ix-apps/*|*/ix-applications|*/ix-applications/*) continue ;;
+    esac
     roots+=("$target")
-  done < /proc/self/mounts
+  done < "${DUPEMAP_MOUNTS:-/proc/self/mounts}"   # (another list only in DupeMap's tests)
 fi
 if [ ${#roots[@]} -eq 0 ]; then
   echo "Nothing to scan: no file systems of the chosen kinds ($KINDS) were found." >&2
@@ -81,7 +86,8 @@ size_test=()
 if [ "$MIN" -gt 0 ] 2>/dev/null; then size_test=(-size "+$((MIN - 1))c"); fi
 
 # progress every minute
-( while sleep 60; do echo "  $(( $(wc -l < "$OUT") - 1 )) files in the manifest"; done ) &
+# (sleep's output goes nowhere, so a pipe like `| tee log` closes as soon as the script ends)
+( while sleep 60 > /dev/null 2>&1; do echo "  $(( $(wc -l < "$OUT") - 1 )) files in the manifest"; done ) &
 TICK=$!
 
 for r in "${roots[@]}"; do

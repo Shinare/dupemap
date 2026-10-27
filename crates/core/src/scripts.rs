@@ -147,6 +147,71 @@ mod tests {
         assert_eq!(size_text(1000), "1000 bytes");
     }
 
+    /// The bash script picks the same mounts as the built-in scan: not TrueNAS's boot pool,
+    /// .system dataset or app data, not system folders mounted on their own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_script_picks_the_mounts_the_app_offers() {
+        let dir = std::env::temp_dir().join(format!("dupemap-mounts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // (source, mount point, file system); the mount points do not exist, so nothing is hashed
+        let mounts = [
+            ("boot-pool/ROOT/24.10.2", "/", "zfs"),
+            ("boot-pool/ROOT/24.10.2/usr", "/usr", "zfs"),
+            ("boot-pool/ROOT/24.10.2/conf", "/conf", "zfs"),
+            ("boot-pool/ROOT/24.10.2/var/log", "/var/log", "zfs"),
+            ("tank/.system", "/var/db/system", "zfs"),
+            ("tank", "/mnt/dupemap-test/tank", "zfs"),
+            ("tank/media", "/mnt/dupemap-test/tank/media", "zfs"),
+            ("tank/ix-applications", "/mnt/dupemap-test/tank/ix-applications", "zfs"),
+            ("tank/.ix-apps", "/mnt/dupemap-test/.ix-apps", "zfs"),
+            ("backup/photos", "/mnt/dupemap-test/backup/my\\040photos", "zfs"),
+            ("proc", "/proc", "proc"),
+            ("tmpfs", "/run", "tmpfs"),
+            ("//nas/share", "/mnt/dupemap-test/share", "cifs"),
+        ];
+        let table: String = mounts.iter().map(|(s, t, f)| format!("{s} {t} {f} rw 0 0\n")).collect();
+        let table_file = dir.join("mounts");
+        std::fs::write(&table_file, table).unwrap();
+        let script = dir.join("scan.sh");
+        let o = ScriptOptions {
+            os: ScriptOs::Linux,
+            kinds: vec![DriveKind::Internal, DriveKind::Network],
+            min_size: 1 << 40,
+        };
+        std::fs::write(&script, generate(&o)).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .current_dir(&dir)
+            .env("DUPEMAP_MOUNTS", &table_file)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let listed: Vec<&str> =
+            text.lines().filter_map(|l| l.strip_prefix("Listing ").and_then(|l| l.strip_suffix(" ..."))).collect();
+        assert_eq!(
+            listed,
+            [
+                "/mnt/dupemap-test/tank",
+                "/mnt/dupemap-test/tank/media",
+                "/mnt/dupemap-test/backup/my\\040photos",
+                "/mnt/dupemap-test/share"
+            ]
+            .map(|t| t.replace("\\040", " ")),
+            "script output:\n{text}"
+        );
+        // the app's rule agrees
+        for (s, t, f) in mounts {
+            if f == "proc" || f == "tmpfs" {
+                continue;
+            }
+            let offered = listed.contains(&t.replace("\\040", " ").as_str());
+            assert_eq!(!crate::scan::skip_mount(s, t), offered, "{s} on {t}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The bash script and the built-in scan write the same lines for the same folder.
     #[cfg(target_os = "linux")]
     #[test]
