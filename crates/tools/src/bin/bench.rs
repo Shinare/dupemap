@@ -92,6 +92,23 @@ impl Table {
     }
 }
 
+/// Treemaps of everything and of the biggest source, the size of a big window.
+fn treemap_timings(ix: &Index, t: &mut Table) {
+    use dupemap_core::index::{Filter, Node};
+    use dupemap_core::treemap::{build, Options, Rect};
+    let area = Rect::new(0.0, 0.0, 1600.0, 950.0);
+    let class = |f| ix.status_of(f) as u8;
+    let s = Instant::now();
+    let tm = build(ix, Node::AllSources, &Filter::default(), area, &Options::default(), &class);
+    t.ms(&format!("treemap of all sources ({} boxes)", tm.boxes.len()), s);
+    if let Some(src) = ix.source_summaries().iter().enumerate().max_by_key(|(_, s)| s.bytes).map(|(i, _)| i) {
+        let root = ix.sources()[src].root;
+        let s = Instant::now();
+        let tm = build(ix, Node::Dir(root), &Filter::default(), area, &Options::default(), &class);
+        t.ms(&format!("treemap of the biggest source ({} boxes)", tm.boxes.len()), s);
+    }
+}
+
 /// Name and hash searches (each reads the whole file table).
 fn search_timings(db: &Db, ix: &Index, t: &mut Table) {
     use dupemap_core::search::{search, SearchMode, SearchQuery, MAX_HITS};
@@ -149,6 +166,7 @@ fn main() {
         let mut t = Table(Vec::new());
         t.ms(&format!("build index ({} files)", ix.file_count()), s);
         search_timings(&db, &ix, &mut t);
+        treemap_timings(&ix, &mut t);
         println!("\n| step | result |\n|---|---|");
         for (k, v) in &t.0 {
             println!("| {k} | {v} |");
@@ -308,6 +326,7 @@ fn main() {
     }
 
     search_timings(&db, &ix, &mut t);
+    treemap_timings(&ix, &mut t);
 
     drop(ix);
     drop(db);

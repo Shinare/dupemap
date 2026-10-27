@@ -181,10 +181,14 @@ impl Split {
     }
 }
 
+/// A file's duplication status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Status {
+pub enum Status {
+    /// The only copy anywhere.
     Unique,
+    /// Other copies exist, all in the file's own source.
     Within,
+    /// At least one copy is in another source.
     Elsewhere,
 }
 
@@ -273,7 +277,7 @@ impl Index {
         Summary { scope, total, names, categories, exts, sources, unknown_size_files }
     }
 
-    fn status_of(&self, f: FileIx) -> Status {
+    pub fn status_of(&self, f: FileIx) -> Status {
         let (copies, sources) = self.copy_spread(self.file_content(f));
         if copies <= 1 {
             Status::Unique
