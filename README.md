@@ -132,6 +132,22 @@ deletes anything itself.
   see its extensions) and by extension. Every column sorts.
 
   ![Summary by file type for all sources, beside the duplicate groups](docs/screenshot-summary.png)
+* **Treemap** (View → Treemap, or right-click a folder → *Show as treemap*): what a folder, a
+  source or every source holds, as rectangles sized by their bytes, nested folder in folder.
+  * Colours: *Where the copies are* (as the summary: orange elsewhere, striped orange in the
+    same source, grey unique), *File type* (the first eight categories in their colours, the rest
+    grey) or *Marked for deletion* (marked, last copy marked, not marked). A box holding several
+    kinds is split into bands, and the legend gives the bytes of each colour.
+  * Hover for the path, size and split; click to select (the inspector shows it, and its copies
+    are outlined in orange wherever they are, or the box hiding them); double-click or Enter
+    zooms into a folder, Backspace or the trail above goes back up.
+  * Right-click for the same marking and other actions as in a tree; Del marks or unmarks.
+  * Items too small to draw are grouped into one dimmed "N smaller items" box per folder;
+    zoom in to see them. A folder that holds just one folder shares its header with it
+    (`truenas › / › mnt`). The tab's filter applies: with *With a copy in another source* the
+    boxes show where the reclaimable space is.
+
+  ![The treemap of every source, coloured by where the copies are; the copies of the selected file are outlined](docs/screenshot-treemap.png)
 * **File type categories** (View → File type categories…, or *Categories…* in a summary): a
   category is a list of extensions. Rename, reorder, add or remove categories, edit their
   extensions, or pick from the largest extensions that are in no category yet ("Other").
@@ -224,7 +240,9 @@ Help → Keyboard shortcuts (F1) shows them in the app too.
 | Del | mark or unmark for deletion |
 
 In search results and duplicate groups, the same keys move; Enter shows the file in a tab (the
-first copy of a group), and Del marks or unmarks a search result.
+first copy of a group), and Del marks or unmarks a search result. In the treemap, double-click or
+Enter zooms into the selected folder (a file: shows it in a tab), Backspace goes up one level and
+Del marks or unmarks.
 
 ## Files, options and the session
 
@@ -280,6 +298,7 @@ be in the same range.
 | list a folder of 73,000 files | 0.15 s |
 | duplicate groups: first page / sorted by size of each copy | 0.02 s / 0.18 s |
 | search by name / by hash | 0.15–0.8 s / a few milliseconds |
+| treemap of every source / of the biggest one (about 8,000–10,000 boxes) | 0.04 s / 0.02 s |
 | remove a manifest of 1 million rows (and restore what it replaced) | a few seconds |
 
 Every CI run posts the same benchmark on 1 million rows on a Windows runner in its pull request.
