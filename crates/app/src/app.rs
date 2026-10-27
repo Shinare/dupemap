@@ -1323,11 +1323,20 @@ impl DupeMapApp {
                         actions.push(Action::OpenIgnoreEditor);
                     }
                 }
-                ui.label(
-                    RichText::new("· only files ≥ the scripts' minimum size (1 MB) are hashed")
-                        .color(colors::INK_MUTED),
-                )
-                .on_hover_text("The export scripts skip small files, so they never appear here.");
+                // the right side (marks, alerts, a running job) needs its room in a narrow window
+                let alerts = self.manifests.iter().any(|m| m.severity == Severity::Alert && !m.alert_dismissed);
+                let marked = self.mark_state.as_deref().is_some_and(|m| !m.is_empty());
+                let reserve = if marked { 340.0 } else { 0.0 }
+                    + if alerts { 220.0 } else { 0.0 }
+                    + if self.job.is_some() { 420.0 } else { 0.0 };
+                let hint = if ui.available_width() - reserve > 440.0 {
+                    "· only files ≥ the scripts' minimum size (1 MB) are hashed"
+                } else {
+                    "· files ≥ 1 MB"
+                };
+                ui.label(RichText::new(hint).color(colors::INK_MUTED)).on_hover_text(
+                    "Only files of at least the scripts' minimum size (1 MB) are hashed: smaller files never appear here.",
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let alerts =
