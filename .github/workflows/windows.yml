@@ -67,6 +67,17 @@ jobs:
           # the generated manifests contain deliberate bad lines, so alerts (exit code 1) are expected
           if ($LASTEXITCODE -ne 1) { throw "dupemap-check: expected exit code 1 (alerts), got $LASTEXITCODE" }
           .\target\release\dupemap-check.exe "$env:RUNNER_TEMP\gen\manifest-*.tsv" --top 1 | Select-Object -First 3
+          # the built-in scan: the drives it sees, then a folder hashed into a manifest that imports
+          .\target\release\dupemap-scan.exe --list
+          if ($LASTEXITCODE -ne 0) { throw "dupemap-scan --list failed with $LASTEXITCODE" }
+          $scan = "$env:RUNNER_TEMP\scanme"
+          New-Item -ItemType Directory -Force -Path "$scan\sub dir" | Out-Null
+          [IO.File]::WriteAllBytes("$scan\a.bin", (New-Object byte[] 200000))
+          [IO.File]::WriteAllBytes("$scan\sub dir\copy of a.bin", (New-Object byte[] 200000))
+          .\target\release\dupemap-scan.exe --folder $scan --host "CI test" --out "$env:RUNNER_TEMP\scans" --min-size 1000
+          if ($LASTEXITCODE -ne 0) { throw "dupemap-scan failed with $LASTEXITCODE" }
+          .\target\release\dupemap-check.exe "$env:RUNNER_TEMP\scans" --top 1
+          if ($LASTEXITCODE -ne 0) { throw "the scanned manifest did not import cleanly ($LASTEXITCODE)" }
           .\target\release\dupemap-bench.exe --rows 1000000 --work "$env:RUNNER_TEMP\bench" | Out-File -Encoding utf8 "$env:RUNNER_TEMP\bench.md"
           if ($LASTEXITCODE -ne 0) { throw "dupemap-bench failed with $LASTEXITCODE" }
           Get-Content "$env:RUNNER_TEMP\bench.md"
@@ -125,6 +136,7 @@ jobs:
             target/release/dupemap-gen.exe
             target/release/dupemap-check.exe
             target/release/dupemap-bench.exe
+            target/release/dupemap-scan.exe
           if-no-files-found: error
           retention-days: 30
 
