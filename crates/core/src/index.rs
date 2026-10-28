@@ -1253,6 +1253,13 @@ impl Index {
         self.compile(filter).test(self, f)
     }
 
+    /// The filter as a test to run on many files (prepared once).
+    pub fn matcher(&self, filter: &Filter) -> impl Fn(FileIx) -> bool + '_ {
+        let all = filter.is_all();
+        let cf = self.compile(filter);
+        move |f| all || cf.test(self, f)
+    }
+
     /// Folder statistics for a filter (cached).
     pub fn rollup(&self, filter: &Filter) -> Arc<Rollup> {
         {

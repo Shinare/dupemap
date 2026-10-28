@@ -31,6 +31,7 @@ mod shot;
 mod summary_ui;
 mod theme;
 mod tree;
+mod treemap_ui;
 mod widgets;
 mod worker;
 

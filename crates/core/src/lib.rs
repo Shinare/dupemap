@@ -28,6 +28,7 @@ pub mod search;
 pub mod sessionfile;
 pub mod summary;
 pub mod synth;
+pub mod treemap;
 
 pub use db::Db;
 pub use error::{Error, Result};

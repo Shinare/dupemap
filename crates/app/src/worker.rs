@@ -84,6 +84,8 @@ pub enum Query {
     SaveMarks(Arc<Vec<MarkRule>>),
     /// Write delete scripts.
     Export(Box<ExportRequest>),
+    /// Lay out a treemap tab (only the newest waiting request of each tab is done).
+    Treemap(Box<crate::treemap_ui::TreemapRequest>),
     /// Find files and folders by name or hash (answered by the search thread; a newer search
     /// stops an older one).
     Search {
@@ -168,6 +170,7 @@ pub struct GroupRow {
 }
 
 pub enum Reply {
+    Treemap(Arc<crate::treemap_ui::TreemapView>),
     Files {
         generation: u64,
         dir: DirIx,
@@ -327,6 +330,15 @@ impl Worker {
                                 repaint();
                             }
                             Query::Search { .. } => {}
+                            Query::Treemap(req) => {
+                                let Some((g, ix, db, _)) = &state else { continue };
+                                if *g != req.key.generation {
+                                    continue;
+                                }
+                                let view = crate::treemap_ui::make_view(ix, db, &req);
+                                let _ = rtx.send(Reply::Treemap(Arc::new(view)));
+                                repaint();
+                            }
                             Query::Marks { generation, version, rules } => {
                                 let Some((g, ix, db, _)) = &state else { continue };
                                 if *g != generation {
@@ -479,6 +491,16 @@ fn prioritise(batch: Vec<Query>) -> Vec<Query> {
     let last_inspect = batch.iter().rposition(|q| matches!(q, Query::Inspect { .. }));
     let last_marks = batch.iter().rposition(|q| matches!(q, Query::Marks { .. }));
     let last_save = batch.iter().rposition(|q| matches!(q, Query::SaveMarks(_)));
+    // a tab being resized asks again every frame: only its newest layout is wanted
+    let newer_treemap = |i: usize, pane: u64, batch: &[Query]| {
+        batch[i + 1..].iter().any(|q| matches!(q, Query::Treemap(r) if r.key.pane == pane))
+    };
+    let stale: Vec<bool> = (0..batch.len())
+        .map(|i| match &batch[i] {
+            Query::Treemap(r) => newer_treemap(i, r.key.pane, &batch),
+            _ => false,
+        })
+        .collect();
     let (mut first, mut second, mut third) = (Vec::new(), Vec::new(), Vec::new());
     for (i, q) in batch.into_iter().enumerate() {
         match q {
@@ -486,6 +508,7 @@ fn prioritise(batch: Vec<Query>) -> Vec<Query> {
             Query::Inspect { .. } if Some(i) != last_inspect => {}
             Query::Marks { .. } if Some(i) != last_marks => {}
             Query::SaveMarks(_) if Some(i) != last_save => {}
+            Query::Treemap(_) if stale[i] => {}
             Query::Files { .. } => third.push(q),
             _ => second.push(q),
         }
