@@ -1,0 +1,72 @@
+manifest-PC1.tsv: 37,959 rows (37,959 SHA-256), 3.5 TB, UTF-8 CRLF, 0.2s  [ALERT]
+  ALERT: 4 malformed line(s) skipped (empty hash: 1, missing columns: 2, size is not a number: 1).
+    line 802: malformed (missing columns)  only ⇥ three ⇥ columns
+    line 803: malformed (size is not a number)  6326dbffe0bd28f253d92fe132895a5ad39a74f458d80ee08d4ffad290a038f5 ⇥ 12,345 ⇥ PC1 D: (Data) ⇥ D:\x.bin
+    line 804: malformed (empty hash)   ⇥ 5000000 ⇥ PC1 D: (Data) ⇥ D:\y.bin
+    line 37964: malformed (missing columns)  3fa9c2e1d4b5
+manifest-PC2-usb.tsv: 38,455 rows (38,455 SHA-256), 4.0 TB, UTF-8 CRLF, 0.2s
+manifest-PC2.tsv: 29,610 rows (29,610 SHA-256), 492.5 GB, UTF-8 CRLF, 0.3s  [notice]
+  28423 path(s) are also listed by manifest-PC2-usb.tsv (575 differ in size or hash). Each path counts once: this manifest's listing is shown for 28423, the other's for 0 (SHA-256 first, then the newer scan).
+manifest-PC3.tsv: 5,972 rows (5,972 SHA-256), 524.4 GB, UTF-8 CRLF, 0.0s  [notice]
+  2248 path(s) were listed more than once in this manifest (overlapping scan folders?); extra listings are hidden so they never count as copies.
+manifest-cloud-gdrive.tsv: 7,822 rows (7,775 SHA-256), 115.5 GB, UTF-8 with BOM CRLF, 0.0s  [ALERT]
+  ALERT: 47 row(s) are not SHA-256 (md5: 39, sha1: 8). They are imported but only match rows of the same hash type.
+  16 cloud path(s) appear more than once; cloud drives allow identical names, so they are kept as separate files.
+    line 18: flagged (md5)  md5:62c9a908905ef4e4fc6b5eafce47ceb8 ⇥ 1460661 ⇥ gdrive: ⇥ gdrive:/Google Photos/2015/IMG_13950.JPG
+    line 218: flagged (md5)  md5:cbdf5d37ee18cd5135f8751ecb00efd5 ⇥ 28222130 ⇥ gdrive: ⇥ gdrive:/Google Photos/2015/_DSC14450.ARW
+    line 419: flagged (md5)  md5:d27ce9a5e685f26e8f69beff0270422d ⇥ 3988809 ⇥ gdrive: ⇥ gdrive:/Google Photos/2015/Screenshot 2015-09-27 14950.png
+    line 503: flagged (sha1)  sha1:8e30dca9f661e9b06e7b78b2175fcd3e48c5bd05 ⇥ 7190513 ⇥ gdrive: ⇥ gdrive:/Google Photos/2015/IMG_15160.JPG
+    line 619: flagged (md5)  md5:d5ade898d5201f6e30ef7933d5094fa9 ⇥ 4396003 ⇥ gdrive: ⇥ gdrive:/Google Photos/2016/IMG_15450.JPG
+    line 820: flagged (md5)  md5:72ac43458a9d93d2acf6f7b8744808c1 ⇥ 3132035 ⇥ gdrive: ⇥ gdrive:/Google Photos/2016/IMG_15950.JPG
+    line 1020: flagged (md5)  md5:e64c227334ea1f09a50edafe85f546f3 ⇥ 9186721 ⇥ gdrive: ⇥ gdrive:/Google Photos/2016/IMG_16450.JPG
+    line 1220: flagged (md5)  md5:c4bcdb44850f48a5fbba0b92affd3470 ⇥ 1111729 ⇥ gdrive: ⇥ gdrive:/Google Photos/2017/IMG_16950.HEIC
+    line 1421: flagged (md5)  md5:b98a910a9bc6c47f7b716fd9b1811ba1 ⇥ 2982611 ⇥ gdrive: ⇥ gdrive:/Google Photos/2017/IMG_17450.JPG
+    line 1505: flagged (sha1)  sha1:42adb065282c5b475fd80d8ec84331681ea30786 ⇥ 11033347 ⇥ gdrive: ⇥ gdrive:/Google Photos/2017/Screenshot 2017-09-21 17660.png
+    line 1621: flagged (md5)  md5:4cdf1b186070526bb120ba007910a077 ⇥ 9057444 ⇥ gdrive: ⇥ gdrive:/Google Photos/2017/IMG_17950.JPG
+    line 1822: flagged (md5)  md5:7bcc17f9628feb5ee1974875d3d7098d ⇥ 2528689 ⇥ gdrive: ⇥ gdrive:/Google Photos/2018/IMG_18450.JPG
+manifest-cloud-onedrive-sha256.tsv: 3,073 rows (3,073 SHA-256), 59.0 GB, UTF-8 CRLF, 0.0s
+manifest-cloud-onedrive.tsv: 924 rows (0 SHA-256), 17.1 GB, UTF-8 CRLF, 0.0s  [ALERT]
+  ALERT: 924 row(s) are not SHA-256 (quickxor: 924). They are imported but only match rows of the same hash type.
+  924 path(s) are also listed by manifest-cloud-onedrive-sha256.tsv (924 differ in size or hash). Each path counts once: this manifest's listing is shown for 0, the other's for 924 (SHA-256 first, then the newer scan).
+    line 2: flagged (quickxor)  quickxor:dMwpXM71QFERKikiPNVYDSz8VVc= ⇥ 3471956 ⇥ onedrive: ⇥ onedrive:/Documents/House/2006/Plan 2006-02 1.xlsx
+    line 3: flagged (quickxor)  quickxor:eYLrmWRMMLznz+1kKleTb0Rb3aA= ⇥ 22853013 ⇥ onedrive: ⇥ onedrive:/Documents/Taxes/2010/Datasheet 2010-06 5.pdf
+    line 4: flagged (quickxor)  quickxor:AoFrK9o8Ce35+SEmbPAijx46Zik= ⇥ 1872024 ⇥ onedrive: ⇥ onedrive:/Documents/Insurance/2014/Statement 2014-10 9.odt
+    line 5: flagged (quickxor)  quickxor:fwDk+OsfFBfMM53lAg49qzSoOx4= ⇥ 1778769 ⇥ onedrive: ⇥ onedrive:/Documents/Taxes/2025/Receipt 2025-06 41.xlsx
+    line 6: flagged (quickxor)  quickxor:tDY6t+1xtVhPotYgPKc3TLeTiG0= ⇥ 1659588 ⇥ onedrive: ⇥ onedrive:/Documents/Insurance/2008/Manual 2008-10 45.pdf
+    line 7: flagged (quickxor)  quickxor:CNmZiBjxx0qPSuQx+j3gq5bCfRU= ⇥ 53971169 ⇥ onedrive: ⇥ onedrive:/Documents/House/2012/Statement 2012-02 49.pdf
+    line 8: flagged (quickxor)  quickxor:s+VTF6pX6aybzeQPL+o/FaBvkT0= ⇥ 1133192 ⇥ onedrive: ⇥ onedrive:/Documents/Insurance/2023/Datasheet 2023-10 81.odt
+    line 9: flagged (quickxor)  quickxor:dMIiXlw/pvrGZV+PXyFsvD6jphg= ⇥ 1543008 ⇥ onedrive: ⇥ onedrive:/Documents/House/2006/Receipt 2006-02 85.xlsx
+    line 10: flagged (quickxor)  quickxor:1W8suF0hlnWSYTXnh5UkvRspkTA= ⇥ 17594638 ⇥ onedrive: ⇥ onedrive:/Documents/Taxes/2010/Invoice 2010-06 89.pdf
+    line 11: flagged (quickxor)  quickxor:i+osThfj9oDSkdK2zyttCTbSvhs= ⇥ 1356018 ⇥ onedrive: ⇥ onedrive:/Documents/House/2021/Receipt 2021-02 121.xlsx
+manifest-truenas.tsv: 76,200 rows (76,200 SHA-256), 14.5 TB, UTF-8 LF, 0.5s  [ALERT]
+  ALERT: 1 malformed line(s) skipped (missing columns: 1).
+  38 path(s) contain bytes that are not valid UTF-8; shown with �, exact bytes kept for scripts.
+    line 76202: malformed (missing columns)   part two.txt
+
+Index: 168,420 files, 10,413 folders, 55,374 distinct contents, 43,767 duplicate groups (0.1s)
+
+source                                 files       size  dup files in other sources   only here  flagged
+gdrive:                                7,822   115.5 GB      7,767         115.1 GB          55       47
+onedrive:                              3,073    59.0 GB      3,073          59.0 GB           0        0
+PC1 C: (Windows)                       4,011   932.2 GB      3,616         454.1 GB         413        0
+PC1 D: (Data)                         33,948     2.6 TB     31,613           1.7 TB       2,335        0
+PC2 C: (OS)                              900    55.5 GB        900          55.5 GB           0        0
+PC2 E: (Backup 2TB)                   28,710   437.0 GB     28,710         437.0 GB           0        0
+PC2 F: (Old Seagate)                  10,032     3.6 TB     10,032           3.6 TB           0        0
+PC3 C: (Windows)                       3,724   442.7 GB      3,724         442.7 GB           0        0
+truenas                               76,200    14.5 TB     67,378           5.5 TB       8,822        0
+
+43,767 duplicate groups; keeping one copy of each would free 6.7 TB.
+  1. 46.7 GB wasted, 3 copies of 23.4 GB
+       C:\Users\User\Downloads\backup-2024-09-13 #320.tar.gz  [PC1 C: (Windows)]
+       C:\Users\User\Downloads\backup-2024-09-13 #320.tar (2).gz  [PC1 C: (Windows)]
+       /mnt/backup/archive/Archives/backup-2024-09-13 #320.tar.gz  [truenas]
+  2. 26.4 GB wasted, 2 copies of 26.4 GB
+       C:\Users\User\Downloads\backup-2021-06-10 #65.zip  [PC1 C: (Windows)]
+       /mnt/backup/archive/Archives/backup-2021-06-10 #65.zip  [truenas]
+  3. 25.8 GB wasted, 3 copies of 12.9 GB
+       C:\Users\User\Downloads\backup-2020-01-09 #540.rar  [PC1 C: (Windows)]
+       C:\Users\User\Downloads\backup-2020-01-09 #540 (2).rar  [PC1 C: (Windows)]
+       /mnt/backup/archive/Archives/backup-2020-01-09 #540.rar  [truenas]
+
+4 manifest(s) raised alerts; see above.
